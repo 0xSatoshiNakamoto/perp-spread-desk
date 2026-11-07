@@ -8,7 +8,15 @@ Live site: https://0xsatoshinakamoto.github.io/perp-spread-desk/
 
 - Hyperliquid and Lighter stream over WebSocket (about one update per second); Variational is polled every 5 s.
 - Everything runs in the browser: one `index.html`, no build step, no server, no API keys.
-- To add an exchange, copy the `TEMPLATE` adapter near the top of the script in `index.html` and add it to `VENUES`.
+- Code lives in `app.js`. To add an exchange, copy the `TEMPLATE` adapter near the top of `app.js`, add it to `VENUES`,
+  and add the exchange's `https://` / `wss://` address to `connect-src` in the Content-Security-Policy line of `index.html`.
+
+## Security
+
+- No accounts, wallets, keys or user data: the page only reads public market data.
+- Content-Security-Policy allows only this site's own `app.js`, the pinned chart library, and the listed exchange APIs.
+- The chart library is pinned to an exact version with a Subresource Integrity hash.
+- Every value received from an exchange is escaped before it is shown.
 
 Variational quotes can be 20–80 s old; quotes older than the "Max quote age" setting are left out of gap numbers.
 Pre-IPO markets price off each venue's own order book, so their gaps are not guaranteed to close.
