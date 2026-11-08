@@ -6,6 +6,14 @@ that logs when a gap opens or closes.
 
 Live site: https://0xsatoshinakamoto.github.io/perp-spread-desk/
 
+## Arb scanner
+
+Six rule-based agents run in the browser and grade every same-asset pair:
+pair finder → history (candles from Hyperliquid and Lighter) → session tagger (US hours, overnight, weekend)
+→ quality guard (one-venue spikes, stale books, standing premiums, crypto / pre-IPO risk, thin volume)
+→ backtester (your entry/exit gap rule, fills one bar late, fees + slippage) → judge (Tradeable / Watch / Avoid).
+Results come from last-trade candle prices; confirm the live bid/ask gap before trading. Funding is not included.
+
 - Hyperliquid and Lighter stream over WebSocket (about one update per second); Variational is polled every 5 s.
 - Everything runs in the browser: one `index.html`, no build step, no server, no API keys.
 - Code lives in `app.js`. To add an exchange, copy the `TEMPLATE` adapter near the top of `app.js`, add it to `VENUES`,

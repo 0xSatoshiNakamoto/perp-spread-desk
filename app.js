@@ -77,12 +77,18 @@ const hyperliquid = {
       if (r.status !== "fulfilled") continue;
       const [dex, [meta, ctxs]] = r.value;
       this.uni[dex] = meta.universe.map(a => ({ name: a.name, delisted: !!a.isDelisted }));
-      meta.universe.forEach((a, i) => { if (!a.isDelisted && ctxs[i]) { this.applyCtx(feed, dex, a.name, ctxs[i], true); n++; } });
+      meta.universe.forEach((a, i) => { if (!a.isDelisted && ctxs[i]) { this.applyCtx(feed, dex, a.name, ctxs[i], true, this.feeOf(dex, a)); n++; } });
     }
     if (!n) throw new Error("no markets returned");
   },
   exOf(dex) { return dex ? "hl-" + dex : "hl"; },
-  applyCtx(feed, dex, name, c, first) {
+  // taker fee per fill, from the Hyperliquid fee docs: builder dexes scale the base fee, growth mode cuts it 90 %
+  feeOf(dex, a) {
+    if (!dex) return 0.00045;
+    const s = +a.deployerFeeScale || 0;
+    return 0.00045 * (s < 1 ? s + 1 : s * 2) * (a.growthMode === "enabled" ? 0.1 : 1);
+  },
+  applyCtx(feed, dex, name, c, first, fee) {
     const imp = c.impactPxs || [];
     const mark = +c.markPx, mid = c.midPx != null ? +c.midPx : mark;
     const m = {
@@ -93,7 +99,7 @@ const hyperliquid = {
     if (first) Object.assign(m, {
       exchangeLabel: dex ? "HL " + dex : "HL main",
       exchangeTitle: dex ? `Hyperliquid builder dex "${dex}" (${this.names[dex]})` : "Hyperliquid validator-operated perps",
-      ticker: name.split(":").pop(), hist: { coin: name },
+      ticker: name.split(":").pop(), hist: { coin: name }, takerFee: fee ?? 0.00045, hlDex: dex,
     });
     feed.upsert(m);
   },
@@ -135,7 +141,7 @@ const hyperliquid = {
   },
   async candles(m, iv, startMs, endMs) {
     const c = await getJSON(HL_REST, { type: "candleSnapshot", req: { coin: m.hist.coin, interval: iv, startTime: startMs, endTime: endMs } });
-    return c.map(x => [x.t, +x.c]);
+    return c.map(x => [x.t, +x.c, +x.h, +x.l, +x.n > 0]);
   },
 };
 
@@ -151,7 +157,8 @@ const lighter = {
       this.perps.set(String(m.market_id), m.symbol);
       feed.upsert({
         exchange: "lighter", exchangeLabel: "Lighter", exchangeTitle: "Lighter (zk order book)",
-        id: String(m.market_id), ticker: m.symbol, hist: { marketId: m.market_id },
+        id: String(m.market_id), ticker: m.symbol, hist: { marketId: m.market_id }, takerFee: 0,   // Standard account: 0 fees
+        lighterCat: { strategy: m.strategy_index, fpm: m.funding_premium_multiplier },
         price: +m.last_trade_price || null, volume24h: +m.daily_quote_token_volume, oiUsd: +m.open_interest_usd || null,
       });
     }
@@ -204,12 +211,12 @@ const lighter = {
       const r = await getJSON(`${LT_REST}/candles?market_id=${m.hist.marketId}&resolution=${iv}&start_timestamp=${from}&end_timestamp=${end}&count_back=500`);
       const page = r.c || [];
       if (!page.length) break;
-      for (const x of page) rows.set(x.t, +x.c);
+      for (const x of page) rows.set(x.t, [x.t, +x.c, +x.h, +x.l, +x.V > 0]);
       const first = Math.floor(page[0].t / 1000);
       if (first >= end) break;
       end = first - 1;
     }
-    return [...rows.entries()].sort((a, b) => a[0] - b[0]);
+    return [...rows.values()].sort((a, b) => a[0] - b[0]);
   },
 };
 
@@ -252,7 +259,11 @@ const variational = pollingVenue({
         price: bid && ask ? (bid + ask) / 2 : +m.mark_price, bid, ask,
         fundingApr: apr != null ? +apr : null, volume24h: +m.volume_24h || 0,
         oiUsd: m.open_interest ? (+m.open_interest.long_open_interest || 0) + (+m.open_interest.short_open_interest || 0) : null,
-        quoteAt: q.updated_at ? Date.parse(q.updated_at) : null, hist: null,
+        quoteAt: q.updated_at ? Date.parse(q.updated_at) : null, hist: null, takerFee: 0,
+        varType: m.contract_type, varName: m.name || "",
+        // swaps stop quoting when their market is shut (weekends): no next funding time = closed
+        closed: m.contract_type === "swap" && !(m.funding && m.funding.next),
+        spreadBps: m.base_spread_bps != null ? +m.base_spread_bps : null,
       };
     }).filter(m => m.price > 0);
   },
@@ -297,6 +308,70 @@ const NOT_SAME = new Set(["hl|SPX"]);   // SPX on HL main = SPX6900 memecoin, no
 const ALIAS_OF = {};
 for (const g of ALIASES) for (const n of g) ALIAS_OF[n] = g[0];
 const canonOf = t => { const u = t.toUpperCase().replace(/-PERP$/, ""); return ALIAS_OF[u] || u; };
+
+/* =============================================================================================
+   ASSET CLASSES. Lighter publishes a category per market (strategy_index) and a funding multiplier
+   (100 = crypto, 50 = stocks/indices/FX/commodities, 1 = pre-IPO). That is the most reliable source,
+   then Variational's contract type and company name, then which Hyperliquid dex lists it.
+   ============================================================================================= */
+const INDEXES = new Set(["SP500", "NASDAQ100", "DOW30", "RUSSELL2000", "US400-SWAP", "CNA50-SWAP", "TUR30", "JP225", "KR200", "VXI-SWAP", "DXI-SWAP"]);
+const COMMODITIES = new Set(["GOLD", "SILVER", "WTI", "BRENT", "NATGAS", "COPPER", "PLATINUM", "PALLADIUM", "COCOA-SWAP", "HOIL-SWAP", "GASOL-SWAP", "H100"]);
+const PRE_IPO = new Set(["ANTHROPIC", "OPENAI", "SPACEX", "XTEN", "OURA", "VARIATIONAL"]);
+const CLASS_LABEL = { equity: "Stock", index: "Index", commodity: "Commodity", fx: "FX", preipo: "Pre-IPO", crypto: "Crypto" };
+function classOfMarket(m, canon) {
+  if (PRE_IPO.has(canon)) return "preipo";
+  if (INDEXES.has(canon)) return "index";
+  if (COMMODITIES.has(canon)) return "commodity";
+  if (m.lighterCat) {
+    const { strategy, fpm } = m.lighterCat;
+    if (+fpm === 1) return "preipo";
+    if (+fpm === 100) return "crypto";
+    if (strategy === 3) return "commodity";
+    if (strategy === 4) return "fx";
+    if (strategy === 7) return "index";            // TUR30, US10Y and other one-off real-world markets
+    return "equity";
+  }
+  if (m.varType === "swap") return "index";
+  if (m.varType && /\b(Inc|Corp|Corporation|ETF|Ltd|Holdings|Trust|Group|plc|Company|Co\.|Fund|SA|AG|NV)\b/i.test(m.varName)) return "equity";
+  if (m.venue === "hl" && m.exchange === "hl") return "crypto";
+  if (m.venue === "hl") return "equity";            // builder dexes list mostly stocks; refined by other venues
+  return "crypto";
+}
+function classOfAsset(markets, canon) {
+  const rank = m => m.lighterCat ? 0 : m.varType ? 1 : m.exchange === "hl" ? 2 : 3;
+  const best = [...markets].sort((a, b) => rank(a) - rank(b))[0];
+  // a token that also trades on Hyperliquid's crypto dex is crypto, whatever else lists it
+  if (markets.some(m => m.exchange === "hl") && !PRE_IPO.has(canon) && !INDEXES.has(canon) && !COMMODITIES.has(canon)) return "crypto";
+  return best ? classOfMarket(best, canon) : "crypto";
+}
+const TYPE_SETS = { tradfi: ["equity", "index", "commodity", "fx"], "tradfi+pre": ["equity", "index", "commodity", "fx", "preipo"], crypto: ["crypto"], all: null };
+let TYPE_FILTER = "tradfi";
+const typeOk = v => { const set = TYPE_SETS[TYPE_FILTER]; return !set || set.includes(v.a.cls); };
+const jumpTag = v => v.jump ? ` <span class="tag stale" title="${esc(v.jump.m.exchangeLabel)} moved ${fmtPct(v.jump.r)} in about a minute while the other venues barely moved. Treat the gap as suspect.">jump ${esc(v.jump.m.exchangeLabel)}</span>` : "";
+const classTag = cls => `<span class="tag${cls === "crypto" || cls === "preipo" ? " stale" : ""}" title="${cls === "crypto" ? "Crypto token: easier to push around on one venue" : cls === "preipo" ? "Pre-IPO: no outside price, each venue prices off its own book" : "Asset class"}">${CLASS_LABEL[cls] || cls}</span>`;
+
+/* US equity markets: closed from Friday 16:00 to Sunday 18:00 New York time (when index futures reopen).
+   Stock and index perps keep trading then, but nothing outside anchors their price. */
+const NY = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", weekday: "short", hour: "numeric", minute: "numeric", hour12: false });
+const nyCache = new Map();
+function nyParts(tMs) {
+  const k = Math.floor(tMs / 60000);
+  let v = nyCache.get(k);
+  if (!v) {
+    const parts = Object.fromEntries(NY.formatToParts(new Date(k * 60000)).map(p => [p.type, p.value]));
+    v = { day: parts.weekday, min: (+parts.hour % 24) * 60 + +parts.minute };
+    if (nyCache.size > 200000) nyCache.clear();
+    nyCache.set(k, v);
+  }
+  return v;
+}
+function sessionOf(tMs) {
+  const { day, min } = nyParts(tMs);
+  const weekend = day === "Sat" || (day === "Sun" && min < 18 * 60) || (day === "Fri" && min >= 16 * 60);
+  if (weekend) return "weekend";
+  const weekday = !["Sat", "Sun"].includes(day);
+  return weekday && min >= 9 * 60 + 30 && min < 16 * 60 ? "us" : "off";
+}
 
 /* =============================================================================================
    STATE
@@ -420,7 +495,7 @@ function rebuildAssets() {
       const plain = cl === main;
       const key = plain ? c : `${c}~${Math.floor(Math.log10(cl[0].price))}`;
       const label = plain ? c : `${c} (≈${fmtPx(median(ms.map(x => x.price)))} size)`;
-      assets.set(key, { key, label, canon: c, keys: ms.map(m => m.key) });
+      assets.set(key, { key, label, canon: c, keys: ms.map(m => m.key), cls: classOfAsset(ms, c) });
     }
   }
   state.assets = assets;
@@ -441,8 +516,8 @@ function resolveAssetKey(input) {
 /* quote age: live feeds are fresh by definition; venues that say how old a quote is get checked */
 const ageOf = m => m.quoteAt ? Math.max(0, (Date.now() - m.quoteAt) / 1000) : 0;
 let MAX_AGE = 60;
-const freshEnough = m => MAX_AGE == null || ageOf(m) <= MAX_AGE;
-const ageTag = m => { const s = ageOf(m); return s > 15 ? ` <span class="tag ${s > (MAX_AGE ?? 1e9) ? "stale" : ""}" title="The venue says this quote is ${Math.round(s)} s old">${s >= 90 ? Math.round(s / 60) + "m" : Math.round(s) + "s"} old</span>` : ""; };
+const freshEnough = m => !m.closed && (MAX_AGE == null || ageOf(m) <= MAX_AGE);
+const ageTag = m => { if (m.closed) return ` <span class="tag stale" title="This Variational swap is closed (no next funding time; swaps shut for the weekend). Its quote is not live and is left out of gaps.">closed</span>`; const s = ageOf(m); return s > 15 ? ` <span class="tag ${s > (MAX_AGE ?? 1e9) ? "stale" : ""}" title="The venue says this quote is ${Math.round(s)} s old">${s >= 90 ? Math.round(s / 60) + "m" : Math.round(s) + "s"} old</span>` : ""; };
 
 function assetView(a) {
   const all = a.keys.map(k => state.markets.get(k)).filter(m => m && m.price > 0 && isShown(m.exchange));
@@ -464,7 +539,11 @@ function assetView(a) {
   for (const m of all) { if (m.fundingApr == null || !isFinite(m.fundingApr)) continue; if (!fHi || m.fundingApr > fHi.fundingApr) fHi = m; if (!fLo || m.fundingApr < fLo.fundingApr) fLo = m; }
   const minVol = ms.length ? Math.min(...ms.map(m => m.volume24h || 0)) : 0;
   const fundMinVol = all.length ? Math.min(...all.map(m => m.volume24h || 0)) : 0;
-  return { a, ms, all, ref, gaps, hi, lo, maxGap, exec, execPair, fHi, fLo, fundSpread: fHi && fLo && fHi !== fLo ? fHi.fundingApr - fLo.fundingApr : null, minVol, fundMinVol };
+  // a venue that moved > 1 % in the last minute while its twins moved < 0.3 %: possible push on one book
+  let jump = null;
+  const moves = ms.filter(m => m._px && m._px.length > 30).map(m => [m, m.price / m._px[0] - 1]);
+  for (const [m, r] of moves) if (Math.abs(r) > 0.01 && moves.every(([o, ro]) => o === m || Math.abs(ro) < 0.003)) jump = { m, r };
+  return { a, ms, all, ref, gaps, hi, lo, maxGap, exec, execPair, jump, fHi, fLo, fundSpread: fHi && fLo && fHi !== fLo ? fHi.fundingApr - fLo.fundingApr : null, minVol, fundMinVol };
 }
 
 function sortedExchanges() {
@@ -490,6 +569,11 @@ function tick() {
   const now = Date.now();
   state.views = new Map();
   for (const a of state.assets.values()) if (a.keys.length >= 2) state.views.set(a.key, assetView(a));
+  // one-venue jump check: keep ~60 s of prices for every market that has a twin
+  for (const v of state.views.values()) for (const m of v.all) {
+    const b = m._px || (m._px = []);
+    b.push(m.price); if (b.length > 61) b.shift();
+  }
 
   // gap history (1 s) for tracked assets
   for (const key of trackedKeys()) {
@@ -536,17 +620,19 @@ function runAlerts(now) {
   if (!state.alertsArmed) {
     if (!ready || now - state.startedAt < 6000) return;
     let n = 0;
-    for (const v of state.views.values()) if (v.ms.length >= 2 && v.minVol >= minVol && v.maxGap >= thrBps) { state.alertActive.set(v.a.key, { t: now, peak: v.maxGap, start: true }); n++; }
+    for (const v of state.views.values()) if (typeOk(v) && v.ms.length >= 2 && v.minVol >= minVol && v.maxGap >= thrBps) { state.alertActive.set(v.a.key, { t: now, peak: v.maxGap, start: true }); n++; }
     state.alertsArmed = true;
     pushEvent("venue", `Watching ${state.views.size} assets across ${state.exchanges.size} venue columns. ${n} already past ±${thrBps / 100}% at start.`);
     return;
   }
   for (const v of state.views.values()) {
-    if (v.ms.length < 2 || v.minVol < minVol || v.maxGap == null) continue;
+    if (!typeOk(v) || v.ms.length < 2 || v.minVol < minVol || v.maxGap == null) continue;
     const act = state.alertActive.get(v.a.key);
     if (!act && v.maxGap >= thrBps) {
       state.alertActive.set(v.a.key, { t: now, peak: v.maxGap });
-      pushEvent("open", `<b>${esc(v.a.label)}</b> gap opened: ${esc(v.hi.exchangeLabel)} ${fmtBps(v.maxGap)} bps above ${esc(v.lo.exchangeLabel)}`);
+      const warn = v.jump ? ` <span class="tag stale">${esc(v.jump.m.exchangeLabel)} jumped ${fmtPct(v.jump.r)} in a minute: possible push on one book</span>`
+        : sessionOf(now) === "weekend" && ["equity", "index"].includes(v.a.cls) ? ` <span class="tag">weekend: US market shut, no outside price</span>` : "";
+      pushEvent("open", `<b>${esc(v.a.label)}</b> ${classTag(v.a.cls)} gap opened: ${esc(v.hi.exchangeLabel)} ${fmtBps(v.maxGap)} bps above ${esc(v.lo.exchangeLabel)}${warn}`);
     } else if (act) {
       act.peak = Math.max(act.peak, v.maxGap);
       if (v.maxGap < thrBps * 0.8) {
@@ -638,6 +724,7 @@ document.addEventListener("click", e => {
   const th = e.target.closest("th[data-sort]"); if (!th) return;
   const t = th.dataset.table, col = th.dataset.sort, s = state.sort[t];
   state.sort[t] = s && s.col === col ? { col, dir: -s.dir } : { col, dir: -1 };
+  if (t === "sc") { renderScanResults(); return; }
   renderCurrent();
 });
 function applySort(rows, key, getters) {
@@ -676,17 +763,18 @@ function renderCurrent() {
   else if (currentTab === "funding") renderFunding();
   else if (currentTab === "divergence") { renderDvSelectors(); dvLiveTick(); }
   else if (currentTab === "venues") renderVenues();
+  else if (currentTab === "scanner") { if (!sc.agents.finder) { renderAgents(); renderScanResults(); scRuleHint(); } }
 }
 
 /* ---------- dashboard ---------- */
 function topGapRows(n, minVol) {
-  return [...state.views.values()].filter(v => v.ms.length >= 2 && v.maxGap != null && v.minVol >= minVol).sort((a, b) => b.maxGap - a.maxGap).slice(0, n);
+  return [...state.views.values()].filter(v => typeOk(v) && v.ms.length >= 2 && v.maxGap != null && v.minVol >= minVol).sort((a, b) => b.maxGap - a.maxGap).slice(0, n);
 }
 function renderDashboard() {
   const now = Date.now();
   const alertVol = +document.getElementById("alertVol").value || 0;
   const thr = (+document.getElementById("alertThr").value || 1) * 100;
-  const multi = [...state.views.values()].filter(v => v.all.length >= 2);
+  const multi = [...state.views.values()].filter(v => v.all.length >= 2 && typeOk(v));
   const gaps = topGapRows(1, alertVol)[0];
   const fund = multi.filter(v => v.fundSpread != null && v.fundMinVol >= alertVol).sort((a, b) => b.fundSpread - a.fundSpread)[0];
   const online = VENUES.filter(v => state.venueStatus[v.id]?.lastMsg && now - state.venueStatus[v.id].lastMsg < 30000).length;
@@ -695,7 +783,7 @@ function renderDashboard() {
   document.getElementById("kpis").innerHTML =
     k("Feeds online", `${online} / ${VENUES.length}`, `${VENUES.reduce((s, v) => s + msgRate(v.id), 0).toFixed(1)} messages / s`) +
     k("Markets tracked", state.markets.size.toLocaleString(), `${state.exchanges.size} venue columns`) +
-    k("Assets on 2+ venues", multi.length.toLocaleString(), "matched by name and price") +
+    k("Assets on 2+ venues", multi.length.toLocaleString(), sessionOf(now) === "weekend" ? "US market shut: stock gaps unanchored" : sessionOf(now) === "us" ? "US market open" : "US market closed (overnight)", sessionOf(now) === "weekend" ? "muted" : "") +
     k(`Gaps past ±${thr / 100}%`, over, `thinner venue ≥ ${fmtUsd(alertVol)} / day`, over ? "above" : "") +
     k("Widest gap", gaps ? fmtBps(gaps.maxGap) + " bps" : "–", gaps ? `${esc(gaps.a.label)}: ${esc(gaps.hi.exchangeLabel)} vs ${esc(gaps.lo.exchangeLabel)}` : "waiting for data", gaps ? "above" : "") +
     k("Top funding spread", fund ? fmtPct(fund.fundSpread) : "–", fund ? `${esc(fund.a.label)}: short ${esc(fund.fHi.exchangeLabel)}` : "waiting for data");
@@ -706,7 +794,7 @@ function renderDashboard() {
     (rv.map(({ k, key, v }) => {
       if (!v || v.ms.length < 2) return `<tr><td><div class="asset-cell"><b>${esc(v ? v.a.label : k)}</b></div></td><td class="l muted" colspan="9">${!v ? "not listed on the shown venues yet" : v.all.length >= 2 ? "other venues' quotes are older than the max quote age" : "listed on one shown venue only"}</td></tr>`;
       const fh = flash("wl|hi|" + key, v.hi.price), fl = flash("wl|lo|" + key, v.lo.price);
-      return `<tr><td><div class="asset-cell"><b>${esc(v.a.label)}</b><button class="linkish" data-chart="${esc(key)}">chart</button></div></td>
+      return `<tr><td><div class="asset-cell"><b>${esc(v.a.label)}</b>${classTag(v.a.cls)}${jumpTag(v)}<button class="linkish" data-chart="${esc(key)}">chart</button></div></td>
         <td class="l">${esc(v.hi.exchangeLabel)}${ageTag(v.hi)}</td><td class="num ${fh}">${fmtPx(v.hi.price)}</td>
         <td class="l">${esc(v.lo.exchangeLabel)}${ageTag(v.lo)}</td><td class="num ${fl}">${fmtPx(v.lo.price)}</td>
         <td class="num ${v.maxGap >= thr ? "above" : ""}">${fmtBps(v.maxGap)}</td>
@@ -719,7 +807,7 @@ function renderDashboard() {
   const tg = topGapRows(10, alertVol);
   const maxG = tg[0]?.maxGap || 1;
   document.getElementById("topGaps").innerHTML = tg.length ? `<thead><tr><th>Asset</th><th class="l">Above</th><th class="l">Below</th><th>Gap bps</th></tr></thead><tbody>` +
-    tg.map(v => `<tr><td><div class="asset-cell"><b>${esc(v.a.label)}</b><button class="linkish" data-add="${esc(v.a.key)}">+ watch</button></div></td>
+    tg.map(v => `<tr><td><div class="asset-cell"><b>${esc(v.a.label)}</b>${classTag(v.a.cls)}${jumpTag(v)}<button class="linkish" data-add="${esc(v.a.key)}">+ watch</button></div></td>
       <td class="l">${esc(v.hi.exchangeLabel)}${ageTag(v.hi)}</td><td class="l">${esc(v.lo.exchangeLabel)}${ageTag(v.lo)}</td>
       <td class="num above">${fmtBps(v.maxGap)}<span class="bar" style="width:${Math.max(4, v.maxGap / maxG * 60).toFixed(0)}px"></span></td></tr>`).join("") + "</tbody>"
     : `<tbody><tr><td class="empty">Waiting for two venues to report…</td></tr></tbody>`;
@@ -843,10 +931,10 @@ function renderCompare() {
   document.getElementById("cmpTable").innerHTML = head + `<tbody>${body}</tbody>`;
 
   const minVol = +document.getElementById("minVol").value || 0;
-  let opp = [...state.views.values()].filter(v => v.ms.length >= 2 && v.maxGap != null && v.minVol >= minVol);
+  let opp = [...state.views.values()].filter(v => typeOk(v) && v.ms.length >= 2 && v.maxGap != null && v.minVol >= minVol);
   opp = applySort(opp, "opp", { asset: r => r.a.label, gap: r => r.maxGap, exec: r => r.exec, vol: r => r.minVol, n: r => r.ms.length, fund: r => r.fundSpread }).slice(0, 50);
   const oh = `<thead><tr>${sortHeader("opp", "asset", "Asset")}<th class="l">Richest</th><th class="l">Cheapest</th>${sortHeader("opp", "gap", "Gap bps")}${sortHeader("opp", "exec", "Executable bps")}${sortHeader("opp", "fund", "Funding spread")}${sortHeader("opp", "n", "Venues")}${sortHeader("opp", "vol", "Min 24h vol")}<th></th></tr></thead>`;
-  const ob = opp.map(r => `<tr><td><div class="asset-cell"><b>${esc(r.a.label)}</b></div></td>
+  const ob = opp.map(r => `<tr><td><div class="asset-cell"><b>${esc(r.a.label)}</b>${classTag(r.a.cls)}${jumpTag(r)}</div></td>
       <td class="l">${esc(r.hi.exchangeLabel)}${ageTag(r.hi)} <span class="num muted ${flash("opp|hi|" + r.a.key, r.hi.price)}">${fmtPx(r.hi.price)}</span></td>
       <td class="l">${esc(r.lo.exchangeLabel)}${ageTag(r.lo)} <span class="num muted ${flash("opp|lo|" + r.a.key, r.lo.price)}">${fmtPx(r.lo.price)}</span></td>
       <td class="num above">${fmtBps(r.maxGap)}</td>
@@ -870,7 +958,7 @@ function renderFunding() {
   const q = document.getElementById("fundFilter").value.trim().toUpperCase();
   const minVol = +document.getElementById("fundMinVol").value || 0;
   const notional = +document.getElementById("fundNotional").value || 0;
-  let rows = [...state.views.values()].filter(v => v.all.filter(m => m.fundingApr != null && isFinite(m.fundingApr)).length >= 2 && v.fundMinVol >= minVol && (!q || v.a.label.toUpperCase().includes(q)));
+  let rows = [...state.views.values()].filter(v => typeOk(v) && v.all.filter(m => m.fundingApr != null && isFinite(m.fundingApr)).length >= 2 && v.fundMinVol >= minVol && (!q || v.a.label.toUpperCase().includes(q)));
   const getters = { asset: r => r.a.label, spread: r => r.fundSpread, vol: r => r.fundMinVol };
   for (const e of exs) getters["ex:" + e.id] = r => r.all.find(m => m.exchange === e.id)?.fundingApr ?? null;
   rows = applySort(rows, "fund", getters);
@@ -1062,9 +1150,331 @@ function dvLiveTick() {
 let rsTimer; addEventListener("resize", () => { clearTimeout(rsTimer); rsTimer = setTimeout(() => { mon.series = null; dv.data && drawDivergence(true); }, 200); });
 
 /* =============================================================================================
+   ARB SCANNER — a pipeline of six agents. They run in this browser on the venues' public data.
+   They are rule-based analysts (no chat model): each does one job and hands its result on.
+     1 Pair finder      which same-asset pairs on two venues are worth testing
+     2 History          downloads candles for both legs
+     3 Session tagger   marks every bar: US market hours, overnight, or weekend
+     4 Quality guard    looks for one-venue spikes, stale books, permanent premiums, risky asset types
+     5 Backtester       replays your entry/exit rule bar by bar, with fees and slippage
+     6 Judge            turns all of that into Tradeable / Watch / Avoid, with reasons
+   ============================================================================================= */
+const AGENTS = [
+  { id: "finder", name: "Pair finder" }, { id: "history", name: "History" }, { id: "session", name: "Session tagger" },
+  { id: "quality", name: "Quality guard" }, { id: "backtest", name: "Backtester" }, { id: "judge", name: "Judge" },
+];
+const sc = { running: false, stop: false, agents: {}, log: [], results: [], open: new Set(), cache: new Map(), sort: { col: "net", dir: -1 } };
+state.sort.sc = sc.sort;
+
+function agentSay(id, msg, st = "working") {
+  sc.agents[id] = { msg, st };
+  sc.log.unshift({ t: Date.now(), who: AGENTS.find(a => a.id === id).name, msg });
+  if (sc.log.length > 400) sc.log.length = 400;
+  renderAgents();
+}
+function renderAgents() {
+  document.getElementById("scAgents").innerHTML = AGENTS.map(a => {
+    const s = sc.agents[a.id] || { msg: "waiting", st: "" };
+    return `<div class="kpi agent ${s.st}"><span class="k">${esc(a.name)}</span><span class="v">${esc(s.msg)}</span></div>`;
+  }).join("");
+  document.getElementById("scLog").innerHTML = sc.log.slice(0, 120).map(e =>
+    `<li class="venue"><span class="t">${fmtClock(e.t)}</span><span><b>${esc(e.who)}</b>: ${esc(e.msg)}</span></li>`).join("")
+    || `<li><span class="t"></span><span class="muted">Set your rule and press Run scan.</span></li>`;
+}
+
+function scSettings() {
+  const g = id => document.getElementById(id);
+  return {
+    types: g("scTypes").value, scope: g("scScope").value, iv: g("scIv").value, days: +g("scDays").value,
+    unit: g("scUnit").value, entry: +g("scEntry").value, exit: +g("scExit").value,
+    sizeMode: g("scSizeMode").value, size: +g("scSize").value, slip: +g("scCost").value,
+    holdH: +g("scHold").value, session: g("scSession").value, minVol: +g("scMinVol").value,
+  };
+}
+function scRuleHint() {
+  const s = scSettings(), sp = [...state.markets.values()].find(m => canonOf(m.ticker || "") === "SP500" && m.price > 0);
+  const el = document.getElementById("scRuleHint");
+  if (s.unit === "bps") {
+    el.textContent = sp ? `With SP500 near ${fmtPx(sp.price)}, ${s.entry} bps is about ${(sp.price * s.entry / 1e4).toFixed(1)} points and ${s.exit} bps about ${(sp.price * s.exit / 1e4).toFixed(1)} points. Your old trade (enter at 7–10 points, exit at 2–3) is roughly 10 bps in, 3 bps out.` : "";
+  } else {
+    el.textContent = "Price points are the raw price difference, the way you traded SP500 (enter at 7–10, exit at 2–3). Points only make sense when you scan one asset at a time, so use Watchlist only with a single asset, or switch to bps.";
+  }
+}
+["scUnit", "scEntry", "scExit"].forEach(id => document.getElementById(id).addEventListener("input", scRuleHint));
+document.getElementById("scSizeMode").addEventListener("change", e => { document.getElementById("scSize").value = e.target.value === "usd" ? 10000 : 10; });
+
+/* ---------- 1. pair finder ---------- */
+function findPairs(s) {
+  const set = TYPE_SETS[s.types];
+  const watch = new Set(state.ribbon.map(resolveAssetKey).filter(Boolean));
+  const pairs = [];
+  for (const a of state.assets.values()) {
+    if (a.keys.length < 2 || (set && !set.includes(a.cls))) continue;
+    if (s.scope === "watch" && !watch.has(a.key)) continue;
+    const ms = a.keys.map(k => state.markets.get(k)).filter(m => m && m.hist && isShown(m.exchange) && (m.volume24h || 0) >= s.minVol);
+    for (let i = 0; i < ms.length; i++) for (let j = i + 1; j < ms.length; j++) {
+      const [A, B] = (ms[i].volume24h || 0) >= (ms[j].volume24h || 0) ? [ms[i], ms[j]] : [ms[j], ms[i]];
+      pairs.push({ a, A, B, minVol: Math.min(A.volume24h || 0, B.volume24h || 0) });
+    }
+  }
+  return pairs.sort((x, y) => y.minVol - x.minVol);
+}
+
+/* ---------- 2. history ---------- */
+async function getCandles(m, iv, days) {
+  const key = `${m.key}|${iv}|${days}`;
+  if (sc.cache.has(key)) return sc.cache.get(key);
+  const v = VENUES.find(x => x.id === m.venue);
+  const end = Date.now(), start = end - days * 86400e3;
+  const rows = await v.candles(m, iv, start, end);
+  sc.cache.set(key, rows);
+  return rows;
+}
+
+/* ---------- 4. quality guard ---------- */
+function halfLifeHours(ts, gap) {
+  const hourly = new Map();
+  ts.forEach((t, i) => hourly.set(Math.floor(t / 3600e3), gap[i]));
+  const g = [...hourly.values()];
+  if (g.length < 48) return null;
+  const x = g.slice(0, -1), y = g.slice(1).map((v, i) => v - x[i]);
+  const mx = x.reduce((s, v) => s + v, 0) / x.length;
+  let num = 0, den = 0;
+  for (let i = 0; i < x.length; i++) { num += (x[i] - mx) * y[i]; den += (x[i] - mx) ** 2; }
+  const beta = den ? num / den : 0;
+  return beta < 0 && beta > -1 ? -Math.log(2) / Math.log(1 + beta) : Infinity;
+}
+function spikesPerDay(p, other, days) {
+  // a bar where one venue jumps > 5x its usual move while the other barely moves, and it reverts within 3 bars
+  const r = p.map((v, i) => i ? Math.log(v / p[i - 1]) : 0), ro = other.map((v, i) => i ? Math.log(v / other[i - 1]) : 0);
+  let n = 0;
+  for (let i = 49; i < r.length - 3; i++) {
+    let s2 = 0; for (let k = i - 48; k < i; k++) s2 += r[k] * r[k];
+    const sd = Math.sqrt(s2 / 48) || 1e-9;
+    if (Math.abs(r[i]) > 5 * sd && Math.abs(r[i]) > 0.002 && Math.abs(ro[i]) < 1.5 * sd) {
+      const back = r[i + 1] + r[i + 2] + r[i + 3];
+      if (-back / r[i] > 0.6) n++;
+    }
+  }
+  return n / Math.max(days, 1);
+}
+
+/* ---------- 5. backtester ---------- */
+function backtest(d, s, allowFn, feeA, feeB) {
+  const { t, pa, pb, act } = d;
+  const meas = i => s.unit === "bps" ? (pb[i] / pa[i] - 1) * 1e4 : pb[i] - pa[i];
+  const trades = [];
+  let pos = 0, i0 = -1, worst = 0, k = 1;
+  const holdMs = s.holdH * 3600e3;
+  while (k < t.length - 1) {
+    if (!pos) {
+      const g = meas(k), gp = meas(k - 1);
+      if (allowFn(t[k]) && act[k] && act[k - 1] && Math.abs(g) >= s.entry && Math.abs(gp) >= s.entry && g * gp > 0) {
+        pos = g > 0 ? 1 : -1; i0 = k + 1; worst = 0; k += 2; continue;      // filled on the next bar
+      }
+    } else {
+      const g = meas(k);
+      const q = s.sizeMode === "usd" ? s.size / pa[i0] : s.size;
+      worst = Math.min(worst, q * pos * ((pb[i0] - pa[i0]) - (pb[k] - pa[k])));
+      if ((act[k] && (Math.abs(g) <= s.exit || g * pos < 0)) || t[k] - t[i0] >= holdMs) {
+        const x = k + 1;
+        const ptsIn = pb[i0] - pa[i0], ptsOut = pb[x] - pa[x];
+        const gross = q * pos * (ptsIn - ptsOut);
+        const cost = q * (pa[i0] + pa[x]) * (feeA + feeB + 2 * s.slip / 1e4);   // 4 fills
+        trades.push({ tIn: t[i0], tOut: t[x], dir: pos, gapIn: meas(i0), gapOut: meas(x), ptsIn, ptsOut,
+          gross, cost, net: gross - cost, worst, hours: (t[x] - t[i0]) / 3600e3, sess: sessionOf(t[i0]), forced: t[k] - t[i0] >= holdMs });
+        pos = 0; k = x + 1; continue;
+      }
+    }
+    k++;
+  }
+  return trades;
+}
+const sumNet = tr => tr.reduce((s, x) => s + x.net, 0);
+
+/* ---------- the run ---------- */
+async function runScan() {
+  if (sc.running) return;
+  const s = scSettings();
+  sc.running = true; sc.stop = false; sc.results = []; sc.open.clear(); sc.agents = {}; sc.log = [];
+  document.getElementById("scRun").disabled = true; document.getElementById("scStop").hidden = false;
+  renderScanResults();
+  try {
+    const pairs = findPairs(s);
+    const noHist = [...state.assets.values()].filter(a => a.keys.length >= 2).flatMap(a => a.keys.map(k => state.markets.get(k))).filter(m => m && !m.hist && isShown(m.exchange)).length;
+    agentSay("finder", `${pairs.length} pairs with candle history on both venues and ≥ ${fmtUsd(s.minVol)} daily volume on the thinner one.${noHist ? ` ${noHist} Variational markets left out: Variational publishes no price history (watch them live on the Dashboard).` : ""}`, "done");
+    if (!pairs.length) { agentSay("judge", "Nothing to test with these settings. Lower the volume floor or widen the asset types.", "done"); return; }
+    const allow = { all: () => true, weekday: t => sessionOf(t) !== "weekend", us: t => sessionOf(t) === "us" };
+    let done = 0;
+    const queue = [...pairs];
+    const worker = async () => {
+      while (queue.length && !sc.stop) {
+        const p = queue.shift();
+        const label = `${p.a.label}: ${p.A.exchangeLabel} vs ${p.B.exchangeLabel}`;
+        try {
+          agentSay("history", `Downloading ${label} (${done + 1} of ${pairs.length})`);
+          const [ca, cb] = await Promise.all([getCandles(p.A, s.iv, s.days), getCandles(p.B, s.iv, s.days)]);
+          const mapB = new Map(cb.map(r => [r[0], r]));
+          const d = { t: [], pa: [], pb: [], act: [] };
+          for (const r of ca) { const o = mapB.get(r[0]); if (!o) continue; d.t.push(r[0]); d.pa.push(r[1]); d.pb.push(o[1]); d.act.push(!!(r[4] && o[4])); }
+          if (d.t.length < 100) { sc.results.push({ p, label, skip: `only ${d.t.length} bars on both venues` }); continue; }
+
+          agentSay("session", `Tagging ${d.t.length} bars of ${p.a.label} by market session`);
+          const sess = d.t.map(sessionOf);
+          const share = k => sess.filter(x => x === k).length / sess.length;
+
+          agentSay("quality", `Checking ${label} for spikes, stale books and permanent premiums`);
+          const gapB = d.pa.map((v, i) => (d.pb[i] / v - 1) * 1e4);
+          const absG = gapB.map(Math.abs).sort((x, y) => x - y);
+          const med = absG[absG.length >> 1], p90 = absG[Math.floor(absG.length * .9)];
+          const meanGap = gapB.reduce((x, y) => x + y, 0) / gapB.length;
+          const hl = halfLifeHours(d.t, gapB);
+          const stale = 1 - d.act.filter(Boolean).length / d.act.length;
+          const spA = spikesPerDay(d.pa, d.pb, s.days), spB = spikesPerDay(d.pb, d.pa, s.days);
+          const wkG = gapB.filter((g, i) => sess[i] === "weekend").map(Math.abs), wdG = gapB.filter((g, i) => sess[i] !== "weekend").map(Math.abs);
+          const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
+          const flags = [];
+          let score = 100;
+          if (p.a.cls === "crypto") { score -= 35; flags.push(["Crypto token: one venue can be pushed around (big players have done this to drain market makers). Treat every gap as suspect.", "bad"]); }
+          if (p.a.cls === "preipo") { score -= 25; flags.push(["Pre-IPO: no outside price, so the gap may never close.", "bad"]); }
+          if (p.minVol < 1e6) { score -= 15; flags.push([`Thin: the quieter venue trades ${fmtUsd(p.minVol)} a day, so fills will move the price.`, "warn"]); }
+          if (stale > 0.2) { score -= 15; flags.push([`Stale: ${(stale * 100).toFixed(0)}% of bars had no trade on one venue, so some gaps are just old prices.`, "warn"]); }
+          const sp = Math.max(spA, spB);
+          if (sp >= 0.5) { score -= Math.min(30, sp * 12); flags.push([`${(spA >= spB ? p.A : p.B).exchangeLabel} had ${sp.toFixed(1)} one-venue spikes a day that snapped back: possible manipulation or thin-book wicks.`, sp >= 1.5 ? "bad" : "warn"]); }
+          const persistent = Math.abs(meanGap) >= s.entry * (s.unit === "bps" ? 1 : 1e4 / d.pa[0]) && (hl == null || hl > 48);
+          if (persistent) { score -= 15; flags.push([`Standing premium: ${p.B.exchangeLabel} sits ${fmtBps(meanGap)} bps from ${p.A.exchangeLabel} on average and rarely returns to zero, so entries at your level may never close.`, "warn"]); }
+          if (wkG.length && wdG.length && avg(wkG) > 2 * avg(wdG)) flags.push([`Weekend gaps are ${(avg(wkG) / avg(wdG)).toFixed(1)}× weekday gaps: the US market is shut then, so stock perps trade with no outside price${p.A.venue === "variational" || p.B.venue === "variational" ? " (and Variational's swaps stop quoting)" : ""}.`, "info"]);
+          score = Math.max(0, Math.round(score));
+
+          agentSay("backtest", `Replaying your rule on ${label}`);
+          const fa = p.A.takerFee ?? 0.00045, fb = p.B.takerFee ?? 0.00045;
+          const tr = { all: backtest(d, s, allow.all, fa, fb), weekday: backtest(d, s, allow.weekday, fa, fb), us: backtest(d, s, allow.us, fa, fb) };
+          const main = tr[s.session];
+          const wins = main.filter(x => x.net > 0).length;
+
+          agentSay("judge", `Grading ${label}`);
+          const net = sumNet(main), why = [];
+          let verdict;
+          if (main.length < 3) { verdict = "na"; why.push(`Only ${main.length} trade${main.length === 1 ? "" : "s"} at your entry level in ${s.days} days: not enough to judge.`); }
+          else {
+            // worth bothering with: at least 0.25 % of one leg's notional over the period ($25 per $10k)
+            const notional = s.sizeMode === "usd" ? s.size : s.size * d.pa[d.pa.length - 1];
+            const minNet = 0.0025 * notional, winRate = wins / main.length;
+            if (net >= minNet && winRate >= 0.6 && score >= 65 && !["crypto", "preipo"].includes(p.a.cls)) { verdict = "go"; why.push(`${main.length} trades, ${wins} winners, ${fmtUsd(net)} net after fees and slippage.`); }
+            else if (net > 0) {
+              const reason = net < minNet ? `that is under ${fmtUsd(minNet)} (0.25% of your size), too small to be worth the risk`
+                : score < 65 ? "the quality guard is worried (see flags)" : winRate < 0.6 ? `only ${Math.round(winRate * 100)}% of trades won, so a few big winners carried it` : "the asset type is risky";
+              verdict = "watch"; why.push(`Made ${fmtUsd2(net)} over ${main.length} trades, but ${reason}.`);
+            }
+          }
+          if (verdict === undefined) { verdict = "avoid"; why.push(`Lost ${fmtUsd2(-net)} over ${main.length} trades: the gap rarely closed enough to pay for fees and slippage.`); }
+          const forced = main.filter(x => x.forced).length;
+          if (forced) why.push(`${forced} trade${forced > 1 ? "s" : ""} never reached your exit and were closed after ${s.holdH / 24} day${s.holdH > 24 ? "s" : ""}.`);
+          if (s.session !== "all") { const d2 = sumNet(tr.all) - net; if (Math.abs(d2) > 1) why.push(`Trading any time instead would have ${d2 > 0 ? "added" : "cost"} ${fmtUsd(Math.abs(d2))}${tr.all.filter(x => x.sess === "weekend").length ? `, mostly from ${tr.all.filter(x => x.sess === "weekend").length} weekend trades` : ""}.`); }
+          sc.results.push({ p, label, d, flags, score, verdict, why, tr, main, wins, net, med, p90, meanGap, hl, stale, wkShare: share("weekend"),
+            avgCap: main.length ? main.reduce((x, y) => x + (y.dir * (y.ptsIn - y.ptsOut)), 0) / main.length : null,
+            avgHold: main.length ? main.reduce((x, y) => x + y.hours, 0) / main.length : null, worst: main.reduce((x, y) => Math.min(x, y.worst), 0) });
+        } catch (e) {
+          sc.results.push({ p, label, skip: "could not load history: " + (e.message || e) });
+        } finally {
+          done++;
+          if (done % 3 === 0 || !queue.length) renderScanResults();
+        }
+      }
+    };
+    await Promise.all([worker(), worker()]);           // two at a time, gentle on the APIs
+    const go = sc.results.filter(r => r.verdict === "go").length, w = sc.results.filter(r => r.verdict === "watch").length;
+    for (const a of ["history", "session", "quality", "backtest"]) sc.agents[a] = { msg: `Finished ${done} pairs`, st: "done" };
+    agentSay("judge", sc.stop ? `Stopped after ${done} pairs.` : `Done: ${go} tradeable, ${w} to watch, out of ${done} pairs.`, "done");
+  } finally {
+    sc.running = false;
+    document.getElementById("scRun").disabled = false; document.getElementById("scStop").hidden = true;
+    renderScanResults();
+  }
+}
+document.getElementById("scRun").addEventListener("click", runScan);
+document.getElementById("scStop").addEventListener("click", () => { sc.stop = true; agentSay("judge", "Stopping after the pairs in progress…"); });
+
+/* ---------- results ---------- */
+const VERDICT = { go: "Tradeable", watch: "Watch", avoid: "Avoid", na: "Too few trades" };
+function renderScanResults() {
+  const s = scSettings();
+  const rs = sc.results.filter(r => !r.skip);
+  const go = rs.filter(r => r.verdict === "go");
+  const best = [...rs].sort((a, b) => b.net - a.net)[0];
+  const k = (key, val, sub, c = "") => `<div class="kpi"><span class="k">${key}</span><span class="v ${c}">${val}</span><span class="s">${sub}</span></div>`;
+  document.getElementById("scSummary").innerHTML = rs.length ?
+    k("Pairs graded", rs.length, `${sc.results.length - rs.length} skipped (too little history)`) +
+    k("Tradeable", go.length, "made money, passed the quality guard", go.length ? "above" : "") +
+    k("Best pair", best ? fmtUsd(best.net) : "–", best ? esc(best.label) : "", best && best.net > 0 ? "above" : "") +
+    k("Tradeable pairs together", fmtUsd(go.reduce((x, r) => x + r.net, 0)), `${s.days} days, ${s.sizeMode === "usd" ? fmtUsd(s.size) : s.size + " units"} per leg`) : "";
+  const getters = { pair: r => r.label, cls: r => r.p.a.cls, score: r => r.score, trades: r => r.main.length, win: r => r.main.length ? r.wins / r.main.length : null,
+    net: r => r.net, all: r => sumNet(r.tr.all), cap: r => r.avgCap, hold: r => r.avgHold, worst: r => r.worst, med: r => r.med, verdict: r => ({ go: 3, watch: 2, na: 1, avoid: 0 }[r.verdict]) };
+  const rows = applySort([...rs], "sc", getters);
+  const unitLbl = s.unit === "bps" ? "bps" : "pts";
+  const head = `<thead><tr>${sortHeader("sc", "pair", "Pair")}${sortHeader("sc", "cls", "Type")}${sortHeader("sc", "verdict", "Verdict")}${sortHeader("sc", "score", "Quality")}
+    ${sortHeader("sc", "med", "Typical gap bps", "Median absolute gap over the history")}${sortHeader("sc", "trades", "Trades")}${sortHeader("sc", "win", "Win %")}
+    ${sortHeader("sc", "cap", "Avg capture / unit", "Average price points captured per unit of the asset, before costs")}${sortHeader("sc", "net", "Net $", "Your session setting, after fees and slippage")}
+    ${sortHeader("sc", "all", "Net $, any time", "Same rule with weekend and overnight trades allowed")}${sortHeader("sc", "hold", "Avg hold")}${sortHeader("sc", "worst", "Worst drawdown $")}</tr></thead>`;
+  const body = rows.map(r => {
+    const id = r.p.A.key + "~" + r.p.B.key;
+    const open = sc.open.has(id);
+    const flagTxt = r.flags.filter(f => f[1] !== "info").length;
+    let html = `<tr class="sc-row" data-sc="${esc(id)}" aria-expanded="${open}">
+      <td><div class="asset-cell"><b>${esc(r.p.a.label)}</b><span class="muted">${esc(r.p.A.exchangeLabel)} vs ${esc(r.p.B.exchangeLabel)}</span></div></td>
+      <td class="l">${classTag(r.p.a.cls)}</td>
+      <td class="l"><span class="pill ${r.verdict}">${VERDICT[r.verdict]}</span></td>
+      <td class="num ${r.score >= 65 ? "" : "above"}">${r.score}${flagTxt ? ` <span class="tag stale">${flagTxt} flag${flagTxt > 1 ? "s" : ""}</span>` : ""}</td>
+      <td class="num">${r.med.toFixed(1)}</td><td class="num">${r.main.length}</td>
+      <td class="num">${r.main.length ? Math.round(r.wins / r.main.length * 100) + "%" : "–"}</td>
+      <td class="num">${r.avgCap == null ? "–" : fmtPx(r.avgCap)}</td>
+      <td class="num ${r.net > 0 ? "above" : r.net < 0 ? "below" : ""}">${fmtUsd2(r.net)}</td>
+      <td class="num muted">${fmtUsd2(sumNet(r.tr.all))}</td>
+      <td class="num">${r.avgHold == null ? "–" : fmtDur(r.avgHold * 3600e3)}</td>
+      <td class="num">${fmtUsd2(r.worst)}</td></tr>`;
+    if (open) {
+      const trs = r.main.slice(-40).reverse();
+      html += `<tr class="sc-detail"><td colspan="12"><div style="display:grid;gap:4px;max-width:1000px">
+        <b>Judge</b><ul>${r.why.map(w => `<li>${esc(w)}</li>`).join("")}</ul>
+        <b>Quality guard (score ${r.score} of 100)</b><ul>${r.flags.length ? r.flags.map(f => `<li class="${f[1] === "bad" ? "above" : ""}">${esc(f[0])}</li>`).join("") : "<li>No warning signs: both books traded steadily and the gap kept returning to normal.</li>"}</ul>
+        <span class="muted">Gap ${fmtBps(r.meanGap)} bps on average · 90% of the time within ${r.p90.toFixed(1)} bps · ${r.hl == null ? "half-life n/a" : r.hl === Infinity ? "gap does not revert" : "half-life " + fmtDur(r.hl * 3600e3)} · ${(r.wkShare * 100).toFixed(0)}% of bars on weekends · fees ${((r.p.A.takerFee ?? 0) * 1e4).toFixed(1)} + ${((r.p.B.takerFee ?? 0) * 1e4).toFixed(1)} bps per fill</span>
+        <div><button class="linkish" data-dv="${esc(id)}">Open this pair in Divergence →</button></div>
+        ${trs.length ? `<div class="table-wrap"><table><thead><tr><th>Opened</th><th>Closed</th><th class="l">Side</th><th title="Gap when the entry filled, one bar after the signal">Gap at entry fill (${unitLbl})</th><th title="Gap when the exit filled">Gap at exit fill (${unitLbl})</th><th>Held</th><th>Gross $</th><th>Costs $</th><th>Net $</th><th class="l">Session</th></tr></thead><tbody>
+          ${trs.map(x => `<tr><td class="num">${fmtTime(x.tIn)}</td><td class="num">${fmtTime(x.tOut)}${x.forced ? " (gave up)" : ""}</td>
+            <td class="l">sell ${esc(x.dir > 0 ? r.p.B.exchangeLabel : r.p.A.exchangeLabel)} / buy ${esc(x.dir > 0 ? r.p.A.exchangeLabel : r.p.B.exchangeLabel)}</td>
+            <td class="num">${x.gapIn.toFixed(s.unit === "bps" ? 1 : 2)}</td><td class="num">${x.gapOut.toFixed(s.unit === "bps" ? 1 : 2)}</td>
+            <td class="num">${fmtDur(x.hours * 3600e3)}</td><td class="num">${fmtUsd2(x.gross)}</td><td class="num">${fmtUsd2(x.cost)}</td>
+            <td class="num ${x.net > 0 ? "above" : "below"}">${fmtUsd2(x.net)}</td><td class="l">${{ us: "US hours", off: "overnight", weekend: "weekend" }[x.sess]}</td></tr>`).join("")}
+          </tbody></table></div>` : ""}
+      </div></td></tr>`;
+    }
+    return html;
+  }).join("");
+  const skipped = sc.results.filter(r => r.skip);
+  document.getElementById("scTable").innerHTML = rs.length || skipped.length
+    ? head + `<tbody>${body}${skipped.length ? `<tr><td class="empty" colspan="12">Skipped: ${skipped.slice(0, 12).map(r => esc(r.label) + " (" + esc(r.skip) + ")").join("; ")}${skipped.length > 12 ? ` and ${skipped.length - 12} more` : ""}</td></tr>` : ""}</tbody>`
+    : `<tbody><tr><td class="empty">${sc.running ? "Agents are working…" : "No scan yet. Set your rule above and press Run scan."}</td></tr></tbody>`;
+}
+const fmtUsd2 = v => v == null || !isFinite(v) ? "–" : (v < 0 ? "−$" : "$") + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: Math.abs(v) < 100 ? 2 : 0, maximumFractionDigits: Math.abs(v) < 100 ? 2 : 0 });
+document.getElementById("scTable").addEventListener("click", e => {
+  const dvb = e.target.closest("[data-dv]");
+  if (dvb) {
+    const r = sc.results.find(x => x.p && x.p.A.key + "~" + x.p.B.key === dvb.dataset.dv);
+    if (r) { dv.asset = r.p.a.key; dv.a = r.p.A.exchange; dv.b = r.p.B.exchange; document.getElementById("dvIv").value = document.getElementById("scIv").value; location.hash = "divergence";
+      setTimeout(() => { document.getElementById("dvAsset").dataset.sig = ""; renderDvSelectors(); document.getElementById("dvAsset").value = r.p.a.key; fillDvVenues(); loadDivergence(); }, 0); }
+    return;
+  }
+  if (e.target.closest("th")) return;
+  const tr = e.target.closest("tr.sc-row"); if (!tr) return;
+  const id = tr.dataset.sc;
+  if (sc.open.has(id)) sc.open.delete(id); else sc.open.add(id);
+  renderScanResults();
+});
+
+/* =============================================================================================
    ROUTING, THEME, START
    ============================================================================================= */
-const TABS = ["dashboard", "compare", "funding", "divergence", "venues"];
+const TABS = ["dashboard", "compare", "funding", "divergence", "scanner", "venues"];
 function route() {
   const t = (location.hash || "#dashboard").slice(1);
   currentTab = TABS.includes(t) ? t : "dashboard";
@@ -1078,6 +1488,11 @@ addEventListener("hashchange", route);
 
 const themeSel = document.getElementById("themeSel");
 themeSel.value = store.get("theme", "dark");          // dark by default, like the explorer it is modelled on
+
+const typeSel = document.getElementById("assetTypes");
+typeSel.value = store.get("assetTypes", "tradfi");
+const applyTypes = () => { TYPE_FILTER = typeSel.value; store.set("assetTypes", TYPE_FILTER); state.alertActive.clear(); state.alertsArmed = false; };
+typeSel.addEventListener("change", () => { applyTypes(); tick(); }); applyTypes();
 
 const maxAgeSel = document.getElementById("maxAge");
 maxAgeSel.value = store.get("maxAge", "60");
