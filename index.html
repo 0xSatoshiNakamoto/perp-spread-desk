@@ -276,7 +276,7 @@ footer.notes b { color: var(--fg); font-weight: 600; }
       <section class="widget wide">
         <header><h2>Watchlist</h2>
           <div class="tools"><button class="linkish" type="button" data-go="compare">Edit watchlist</button></div>
-          <p>Richest vs cheapest venue for each asset you follow. The line shows the max gap over the time this page has been open (up to 1 hour).</p></header>
+          <p>For each asset you follow: the fill gap (sell at the bid, buy at the ask) and the mid gap. The line tracks the fill gap while this page is open (up to 1 hour).</p></header>
         <div class="table-wrap"><table id="wlTable"></table></div>
       </section>
       <section class="widget wide">
@@ -290,7 +290,7 @@ footer.notes b { color: var(--fg); font-weight: 600; }
         <div class="chart-box" id="monChart"></div>
       </section>
       <section class="widget">
-        <header><h2>Widest gaps now</h2><p>Assets on 2+ shown venues, thinner venue above the alert volume floor.</p></header>
+        <header><h2>Best fillable gaps now</h2><p>Sell the rich venue at its bid, buy the cheap one at its ask. Mid-price gaps that vanish inside the spreads rank last.</p></header>
         <div class="table-wrap"><table id="topGaps"></table></div>
         <footer><a href="#compare">All gaps</a></footer>
       </section>
@@ -332,10 +332,10 @@ footer.notes b { color: var(--fg); font-weight: 600; }
       <div class="table-wrap"><table id="cmpTable"></table></div>
     </section>
     <section class="widget">
-      <header><h2>Widest gaps right now</h2>
+      <header><h2>Best fillable gaps right now</h2>
         <div class="tools"><label class="field" for="minVol" style="grid-auto-flow:column;align-items:center;gap:6px"><span>Min 24h vol, thinner venue $</span>
           <input type="number" id="minVol" value="250000" step="50000" min="0" style="width:120px"></label></div>
-        <p>Every asset listed on 2+ of the shown venues, ranked by the gap between its richest and cheapest venue.</p></header>
+        <p>Every asset on 2+ shown venues, ranked by the fill gap: what you lock in selling at the best bid and buying at the best ask. Hyperliquid uses its impact prices, Lighter its live top of book, Variational its $1k quote.</p></header>
       <div class="table-wrap"><table id="oppTable"></table></div>
     </section>
   </section>
@@ -380,7 +380,7 @@ footer.notes b { color: var(--fg); font-weight: 600; }
   <section class="view" id="view-scanner" hidden>
     <div class="view-title"><h1>Arb scanner</h1><p>Eight agents hunt for moments when a gap opened and stayed open long enough to trade, simulate your trade on each one, and price it off the real order books.</p></div>
     <section class="widget">
-      <header><h2>Your rule</h2><p>Sell the rich venue, buy the cheap one, close when the gap closes. Every number below can be changed.</p></header>
+      <header><h2>Your rule</h2><p>Sell the rich venue at its bid, buy the cheap one at its ask, close when the gap closes. A gap only counts if it is still at your entry level after paying to cross both order books for your size. Every number below can be changed.</p></header>
       <div class="controls" style="padding:12px 14px 6px">
         <label class="field" for="scEntry"><span>1 · Enter at gap ≥</span><input type="number" id="scEntry" value="10" step="0.5" min="0"></label>
         <label class="field" for="scUnit"><span>Measured in</span>
@@ -420,7 +420,7 @@ footer.notes b { color: var(--fg); font-weight: 600; }
     <section class="widget">
       <header><h2>Right now: gaps you could act on</h2>
         <div class="tools"><button class="linkish" type="button" id="scLiveBtn">Check books now</button></div>
-        <p>Gaps at your entry level this minute, priced off both order books for your size. Edge = what is left after closing at your exit level. Market: taker fees and walking the book. Limit: maker fees, if your orders fill. <span id="scLiveAt"></span></p></header>
+        <p>Every gap at your entry level on mid prices this minute, re-priced the way you would trade it: sell your size into the rich venue's bids, buy it from the cheap venue's asks. Most mid-price gaps on thin books disappear here. <span id="scLiveAt"></span></p></header>
       <div class="table-wrap"><table id="scLive"></table></div>
     </section>
 

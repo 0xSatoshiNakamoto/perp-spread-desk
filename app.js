@@ -258,7 +258,7 @@ const variational = pollingVenue({
     const d = await getJSON(VR_REST);
     const now = Date.now();
     return d.listings.map(m => {
-      const q = m.quotes || {}, k = q.size_1k || q.base || {};
+      const q = m.quotes || {}, k = q.size_1k || q.base || {}, k100 = q.size_100k || {};
       const bid = k.bid != null ? +k.bid : null, ask = k.ask != null ? +k.ask : null;
       // perps carry one signed rate; -SWAP contracts charge separate long/short financing (left out)
       const apr = /-SWAP$/.test(m.ticker) ? null : (m.funding?.next?.annualized_rate ?? m.funding?.last?.annualized_rate);
@@ -269,6 +269,7 @@ const variational = pollingVenue({
         fundingApr: apr != null ? +apr : null, volume24h: +m.volume_24h || 0,
         oiUsd: m.open_interest ? (+m.open_interest.long_open_interest || 0) + (+m.open_interest.short_open_interest || 0) : null,
         quoteAt: q.updated_at ? Date.parse(q.updated_at) : null, hist: null, takerFee: 0,
+        bid100k: k100.bid != null ? +k100.bid : null, ask100k: k100.ask != null ? +k100.ask : null,
         varType: m.contract_type, varName: m.name || "",
         // swaps stop quoting when their market is shut (weekends): no next funding time = closed
         closed: m.contract_type === "swap" && !(m.funding && m.funding.next),
@@ -399,7 +400,7 @@ const state = {
   ribbon: store.get("ribbon", ["SP500", "GOLD", "ANTHROPIC", "OPENAI", "NVDA", "BTC", "PRL", "SILVER"]),
   shownEx: store.get("shownEx", null),
   refEx: store.get("refEx", ""),
-  sort: { cmp: null, opp: { col: "gap", dir: -1 }, fund: { col: "spread", dir: -1 } },
+  sort: { cmp: null, opp: { col: "exec", dir: -1 }, fund: { col: "spread", dir: -1 } },
   liveHist: store.get("liveHist", {}),           // Variational markets: [[t, price]] recorded by this page
   gapHist: new Map(),                            // asset key -> {t:[], max:[], per:{exchange:[]}} 1 s, 1 h
   prevPx: new Map(),                             // for the price flash
@@ -590,7 +591,7 @@ function tick() {
     let h = state.gapHist.get(key);
     if (!h) { h = { t: [], max: [], per: {} }; state.gapHist.set(key, h); }
     const n = h.t.length;
-    h.t.push(now / 1000); h.max.push(v.maxGap);
+    h.t.push(now / 1000); h.max.push(v.exec);
     for (const ex of new Set([...Object.keys(h.per), ...Object.keys(v.gaps)])) {
       const arr = h.per[ex] || (h.per[ex] = new Array(n).fill(null));
       arr.push(v.gaps[ex] ?? null);
@@ -629,25 +630,25 @@ function runAlerts(now) {
   if (!state.alertsArmed) {
     if (!ready || now - state.startedAt < 6000) return;
     let n = 0;
-    for (const v of state.views.values()) if (typeOk(v) && v.ms.length >= 2 && v.minVol >= minVol && v.maxGap >= thrBps) { state.alertActive.set(v.a.key, { t: now, peak: v.maxGap, start: true }); n++; }
+    for (const v of state.views.values()) if (typeOk(v) && v.ms.length >= 2 && v.minVol >= minVol && v.exec >= thrBps) { state.alertActive.set(v.a.key, { t: now, peak: v.exec, start: true }); n++; }
     state.alertsArmed = true;
-    pushEvent("venue", `Watching ${state.views.size} assets across ${state.exchanges.size} venue columns. ${n} already past ±${thrBps / 100}% at start.`);
+    pushEvent("venue", `Watching ${state.views.size} assets across ${state.exchanges.size} venue columns. Alerts use the fill gap (sell at the bid, buy at the ask). ${n} already ≥ ${thrBps / 100}% at start.`);
     return;
   }
   for (const v of state.views.values()) {
-    if (!typeOk(v) || v.ms.length < 2 || v.minVol < minVol || v.maxGap == null) continue;
+    if (!typeOk(v) || v.ms.length < 2 || v.minVol < minVol || v.exec == null) continue;
     const act = state.alertActive.get(v.a.key);
-    if (!act && v.maxGap >= thrBps) {
-      state.alertActive.set(v.a.key, { t: now, peak: v.maxGap });
+    if (!act && v.exec >= thrBps) {
+      state.alertActive.set(v.a.key, { t: now, peak: v.exec });
       const warn = v.jump ? ` <span class="tag stale">${esc(v.jump.m.exchangeLabel)} jumped ${fmtPct(v.jump.r)} in a minute: possible push on one book</span>`
         : sessionOf(now) === "weekend" && ["equity", "index"].includes(v.a.cls) ? ` <span class="tag">weekend: US market shut, no outside price</span>` : "";
-      pushEvent("open", `<b>${esc(v.a.label)}</b> ${classTag(v.a.cls)} gap opened: ${esc(v.hi.exchangeLabel)} ${fmtBps(v.maxGap)} bps above ${esc(v.lo.exchangeLabel)}${warn}`);
+      pushEvent("open", `<b>${esc(v.a.label)}</b> ${classTag(v.a.cls)} fillable gap ${fmtBps(v.exec)} bps: ${sideTxt(v)}${warn}`);
     } else if (act) {
-      act.peak = Math.max(act.peak, v.maxGap);
-      if (v.maxGap < thrBps * 0.8) {
+      act.peak = Math.max(act.peak, v.exec);
+      if (v.exec < thrBps * 0.8) {
         state.alertActive.delete(v.a.key);
-        if (!act.start) pushEvent("close", `<b>${esc(v.a.label)}</b> gap closed to ${fmtBps(v.maxGap)} bps after ${fmtDur(now - act.t)} (peak ${fmtBps(act.peak)} bps)`);
-        else pushEvent("close", `<b>${esc(v.a.label)}</b> gap closed to ${fmtBps(v.maxGap)} bps (it was already open when the page started; peak since then ${fmtBps(act.peak)} bps)`);
+        if (!act.start) pushEvent("close", `<b>${esc(v.a.label)}</b> fillable gap down to ${fmtBps(v.exec)} bps after ${fmtDur(now - act.t)} (peak ${fmtBps(act.peak)} bps; mid gap now ${fmtBps(v.maxGap)})`);
+        else pushEvent("close", `<b>${esc(v.a.label)}</b> fillable gap down to ${fmtBps(v.exec)} bps (it was already open when the page started; peak since then ${fmtBps(act.peak)} bps)`);
       }
     }
   }
@@ -776,9 +777,14 @@ function renderCurrent() {
 }
 
 /* ---------- dashboard ---------- */
+/* The tradeable gap: SELL the rich venue at its BID, BUY the cheap venue at its ASK.
+   A gap between mid prices can be nothing but two wide spreads; only this one can be captured. */
 function topGapRows(n, minVol) {
-  return [...state.views.values()].filter(v => typeOk(v) && v.ms.length >= 2 && v.maxGap != null && v.minVol >= minVol).sort((a, b) => b.maxGap - a.maxGap).slice(0, n);
+  return [...state.views.values()].filter(v => typeOk(v) && v.ms.length >= 2 && v.exec != null && v.minVol >= minVol).sort((a, b) => b.exec - a.exec).slice(0, n);
 }
+const sideTxt = v => v.execPair ? `sell ${esc(v.execPair[1].exchangeLabel)} at ${fmtPx(v.execPair[1].bid)} (bid), buy ${esc(v.execPair[0].exchangeLabel)} at ${fmtPx(v.execPair[0].ask)} (ask)` : "needs bid and ask on two venues";
+const spreadOf = m => m.bid > 0 && m.ask > 0 ? (m.ask - m.bid) / ((m.ask + m.bid) / 2) * 1e4 : null;
+const insideTag = v => v.maxGap != null && v.exec != null && v.exec <= 0 && v.maxGap >= 5 ? ` <span class="tag stale" title="The prices look ${fmtBps(v.maxGap)} bps apart, but after selling at the bid and buying at the ask you would lose ${fmtBps(-v.exec)} bps. The gap is just the spreads.">inside the spread</span>` : "";
 function renderDashboard() {
   const now = Date.now();
   const alertVol = +document.getElementById("alertVol").value || 0;
@@ -787,38 +793,40 @@ function renderDashboard() {
   const gaps = topGapRows(1, alertVol)[0];
   const fund = multi.filter(v => v.fundSpread != null && v.fundMinVol >= alertVol).sort((a, b) => b.fundSpread - a.fundSpread)[0];
   const online = VENUES.filter(v => state.venueStatus[v.id]?.lastMsg && now - state.venueStatus[v.id].lastMsg < 30000).length;
-  const over = multi.filter(v => v.ms.length >= 2 && v.minVol >= alertVol && v.maxGap >= thr).length;
+  const over = multi.filter(v => v.ms.length >= 2 && v.minVol >= alertVol && v.exec >= thr).length;
   const k = (key, val, sub, c = "") => `<div class="kpi"><span class="k">${key}</span><span class="v ${c}">${val}</span><span class="s">${sub}</span></div>`;
   document.getElementById("kpis").innerHTML =
     k("Feeds online", `${online} / ${VENUES.length}`, `${VENUES.reduce((s, v) => s + msgRate(v.id), 0).toFixed(1)} messages / s`) +
     k("Markets tracked", state.markets.size.toLocaleString(), `${state.exchanges.size} venue columns`) +
     k("Assets on 2+ venues", multi.length.toLocaleString(), sessionOf(now) === "weekend" ? "US market shut: stock gaps unanchored" : sessionOf(now) === "us" ? "US market open" : "US market closed (overnight)", sessionOf(now) === "weekend" ? "muted" : "") +
-    k(`Gaps past ±${thr / 100}%`, over, `thinner venue ≥ ${fmtUsd(alertVol)} / day`, over ? "above" : "") +
-    k("Widest gap", gaps ? fmtBps(gaps.maxGap) + " bps" : "–", gaps ? `${esc(gaps.a.label)}: ${esc(gaps.hi.exchangeLabel)} vs ${esc(gaps.lo.exchangeLabel)}` : "waiting for data", gaps ? "above" : "") +
+    k(`Fillable gaps ≥ ${thr / 100}%`, over, `bid vs ask, thinner venue ≥ ${fmtUsd(alertVol)} / day`, over ? "above" : "") +
+    k("Best fillable gap", gaps ? fmtBps(gaps.exec) + " bps" : "–", gaps ? `${esc(gaps.a.label)}: sell ${esc(gaps.execPair[1].exchangeLabel)}, buy ${esc(gaps.execPair[0].exchangeLabel)}` : "waiting for data", gaps && gaps.exec > 0 ? "above" : "below") +
     k("Top funding spread", fund ? fmtPct(fund.fundSpread) : "–", fund ? `${esc(fund.a.label)}: short ${esc(fund.fHi.exchangeLabel)}` : "waiting for data");
 
   // watchlist
   const rv = ribbonViews();
-  document.getElementById("wlTable").innerHTML = `<thead><tr><th>Asset</th><th class="l">Richest venue</th><th>Price</th><th class="l">Cheapest venue</th><th>Price</th><th>Max gap bps</th><th>Executable bps</th><th style="min-width:150px">Max gap, live</th><th>Funding spread</th><th>Min 24h vol</th></tr></thead><tbody>` +
+  document.getElementById("wlTable").innerHTML = `<thead><tr><th>Asset</th><th class="l">Richest venue</th><th>Price</th><th class="l">Cheapest venue</th><th>Price</th><th title="Gap between mid prices: can be just two wide spreads">Mid gap bps</th><th title="Sell the rich venue at its bid, buy the cheap one at its ask. This is the gap you can actually take.">Fill gap bps</th><th style="min-width:150px" title="Fill gap over time while this page is open">Fill gap, live</th><th>Funding spread</th><th>Min 24h vol</th></tr></thead><tbody>` +
     (rv.map(({ k, key, v }) => {
       if (!v || v.ms.length < 2) return `<tr><td><div class="asset-cell"><b>${esc(v ? v.a.label : k)}</b></div></td><td class="l muted" colspan="9">${!v ? "not listed on the shown venues yet" : v.all.length >= 2 ? "other venues' quotes are older than the max quote age" : "listed on one shown venue only"}</td></tr>`;
       const fh = flash("wl|hi|" + key, v.hi.price), fl = flash("wl|lo|" + key, v.lo.price);
       return `<tr><td><div class="asset-cell"><b>${esc(v.a.label)}</b>${classTag(v.a.cls)}${jumpTag(v)}<button class="linkish" data-chart="${esc(key)}">chart</button></div></td>
         <td class="l">${esc(v.hi.exchangeLabel)}${ageTag(v.hi)}</td><td class="num ${fh}">${fmtPx(v.hi.price)}</td>
         <td class="l">${esc(v.lo.exchangeLabel)}${ageTag(v.lo)}</td><td class="num ${fl}">${fmtPx(v.lo.price)}</td>
-        <td class="num ${v.maxGap >= thr ? "above" : ""}">${fmtBps(v.maxGap)}</td>
-        <td class="num ${v.exec > 0 ? "above" : "muted"}" title="${v.execPair ? `buy ${esc(v.execPair[0].exchangeLabel)} ask, sell ${esc(v.execPair[1].exchangeLabel)} bid` : "needs bid/ask on two venues"}">${fmtBps(v.exec)}</td>
+        <td class="num muted">${fmtBps(v.maxGap)}</td>
+        <td class="num ${v.exec >= thr ? "above" : v.exec > 0 ? "" : "below"}" title="${sideTxt(v)}">${fmtBps(v.exec)}${insideTag(v)}</td>
         <td style="padding-block:4px">${spark(key)}</td>
         <td class="num">${v.fundSpread == null ? "–" : fmtPct(v.fundSpread)}</td><td class="num">${fmtUsd(v.minVol)}</td></tr>`;
     }).join("") || `<tr><td class="empty" colspan="10">Your watchlist is empty. Type an asset in the search box at the top.</td></tr>`) + "</tbody>";
 
   // top gaps
   const tg = topGapRows(10, alertVol);
-  const maxG = tg[0]?.maxGap || 1;
-  document.getElementById("topGaps").innerHTML = tg.length ? `<thead><tr><th>Asset</th><th class="l">Above</th><th class="l">Below</th><th>Gap bps</th></tr></thead><tbody>` +
+  const maxG = Math.max(1, tg[0]?.exec || 1);
+  document.getElementById("topGaps").innerHTML = tg.length ? `<thead><tr><th>Asset</th><th class="l">Sell at bid</th><th class="l">Buy at ask</th><th title="What you lock in by crossing both books now">Fill gap bps</th><th title="Gap between mid prices">Mid gap</th></tr></thead><tbody>` +
     tg.map(v => `<tr><td><div class="asset-cell"><b>${esc(v.a.label)}</b>${classTag(v.a.cls)}${jumpTag(v)}<button class="linkish" data-add="${esc(v.a.key)}">+ watch</button></div></td>
-      <td class="l">${esc(v.hi.exchangeLabel)}${ageTag(v.hi)}</td><td class="l">${esc(v.lo.exchangeLabel)}${ageTag(v.lo)}</td>
-      <td class="num above">${fmtBps(v.maxGap)}<span class="bar" style="width:${Math.max(4, v.maxGap / maxG * 60).toFixed(0)}px"></span></td></tr>`).join("") + "</tbody>"
+      <td class="l">${esc(v.execPair[1].exchangeLabel)}${ageTag(v.execPair[1])} <span class="num muted">${fmtPx(v.execPair[1].bid)}</span></td>
+      <td class="l">${esc(v.execPair[0].exchangeLabel)}${ageTag(v.execPair[0])} <span class="num muted">${fmtPx(v.execPair[0].ask)}</span></td>
+      <td class="num ${v.exec > 0 ? "above" : "below"}">${fmtBps(v.exec)}${v.exec > 0 ? `<span class="bar" style="width:${Math.max(4, v.exec / maxG * 60).toFixed(0)}px"></span>` : ""}</td>
+      <td class="num muted">${fmtBps(v.maxGap)}</td></tr>`).join("") + "</tbody>"
     : `<tbody><tr><td class="empty">Waiting for two venues to report…</td></tr></tbody>`;
 
   // top funding
@@ -909,7 +917,7 @@ function renderCompare() {
     if (!v) return `<div class="rib"><button class="x" data-rm="${esc(k)}" aria-label="Remove ${esc(k)}">×</button><span class="name">${esc(k)}</span><span class="sub">not listed on the shown venues yet</span></div>`;
     return `<div class="rib"><button class="x" data-rm="${esc(k)}" aria-label="Remove ${esc(v.a.label)}">×</button>
       <span class="name">${esc(v.a.label)}</span>
-      <span class="num ${v.maxGap >= thr ? "above" : ""}">${v.maxGap == null ? "one venue" : "max gap " + fmtBps(v.maxGap) + " bps"}</span>
+      <span class="num ${v.exec >= thr ? "above" : v.exec != null && v.exec <= 0 ? "below" : ""}" title="${sideTxt(v)}">${v.exec == null ? (v.maxGap == null ? "one venue" : "mid gap " + fmtBps(v.maxGap) + " bps") : "fill gap " + fmtBps(v.exec) + " bps"}</span>
       ${spark(key)}
       <span class="sub">${v.ms.length} venues${v.hi && v.lo && v.hi !== v.lo ? " · " + esc(v.hi.exchangeLabel) + " richest" : ""}</span>
       <button class="linkish" data-chart="${esc(key)}" style="text-align:left">Chart divergence →</button></div>`;
@@ -920,8 +928,8 @@ function renderCompare() {
   for (const e of exs) getters["ex:" + e.id] = r => r.gaps[e.id];
   const rows = applySort([...views], "cmp", getters);
   const head = `<thead><tr>${sortHeader("cmp", "asset", "Asset")}${exs.map(e => sortHeader("cmp", "ex:" + e.id, esc(e.label), e.title)).join("")}
-    ${sortHeader("cmp", "maxGap", "Max gap bps", "Richest vs cheapest venue, mid prices")}
-    ${sortHeader("cmp", "exec", "Executable bps", "Sell the best bid, buy the best ask across venues. Positive = locks in a gap before fees")}
+    ${sortHeader("cmp", "exec", "Fill gap bps", "Sell the rich venue at its bid, buy the cheap one at its ask. Positive = a gap you can lock in before fees")}
+    ${sortHeader("cmp", "maxGap", "Mid gap bps", "Richest vs cheapest venue on mid prices; can be just the spreads")}
     ${sortHeader("cmp", "fund", "Funding spread", "Highest minus lowest annualised funding across shown venues")}
     ${sortHeader("cmp", "vol", "Min 24h vol", "24h volume on the thinnest shown venue")}</tr></thead>`;
   const body = rows.map(r => `<tr>
@@ -933,21 +941,21 @@ function renderCompare() {
         return `<td class="num ${flash("cmp|" + m.key, m.price)}" title="${esc(m.id)}${m.bid != null ? ` · bid ${fmtPx(m.bid)} / ask ${fmtPx(m.ask)}` : ""}${fresh ? "" : " · quote too old, left out of gaps"}"><span class="p">${ageTag(m)} ${fmtPx(m.price)}</span>
           <span class="g ${isRef ? "ref-mark" : fresh ? cls(r.gaps[e.id]) : "muted"}">${isRef ? "REF" : fmtBps(r.gaps[e.id])}</span></td>`;
       }).join("")}
-      <td class="num ${cls(r.maxGap)}">${fmtBps(r.maxGap)}</td>
-      <td class="num ${r.exec > 0 ? "above" : "muted"}" title="${r.execPair ? `buy ${esc(r.execPair[0].exchangeLabel)} ask, sell ${esc(r.execPair[1].exchangeLabel)} bid` : "needs bid/ask on two venues"}">${fmtBps(r.exec)}</td>
+      <td class="num ${r.exec > 0 ? "above" : r.exec != null ? "below" : "muted"}" title="${sideTxt(r)}">${fmtBps(r.exec)}${insideTag(r)}</td>
+      <td class="num muted">${fmtBps(r.maxGap)}</td>
       <td class="num">${r.fundSpread == null ? "–" : fmtPct(r.fundSpread)}</td>
       <td class="num">${fmtUsd(r.minVol)}</td></tr>`).join("");
   document.getElementById("cmpTable").innerHTML = head + `<tbody>${body}</tbody>`;
 
   const minVol = +document.getElementById("minVol").value || 0;
-  let opp = [...state.views.values()].filter(v => typeOk(v) && v.ms.length >= 2 && v.maxGap != null && v.minVol >= minVol);
+  let opp = [...state.views.values()].filter(v => typeOk(v) && v.ms.length >= 2 && v.exec != null && v.minVol >= minVol);
   opp = applySort(opp, "opp", { asset: r => r.a.label, gap: r => r.maxGap, exec: r => r.exec, vol: r => r.minVol, n: r => r.ms.length, fund: r => r.fundSpread }).slice(0, 50);
-  const oh = `<thead><tr>${sortHeader("opp", "asset", "Asset")}<th class="l">Richest</th><th class="l">Cheapest</th>${sortHeader("opp", "gap", "Gap bps")}${sortHeader("opp", "exec", "Executable bps")}${sortHeader("opp", "fund", "Funding spread")}${sortHeader("opp", "n", "Venues")}${sortHeader("opp", "vol", "Min 24h vol")}<th></th></tr></thead>`;
+  const oh = `<thead><tr>${sortHeader("opp", "asset", "Asset")}<th class="l">Sell at bid</th><th class="l">Buy at ask</th>${sortHeader("opp", "exec", "Fill gap bps", "Sell the rich venue at its bid, buy the cheap one at its ask")}${sortHeader("opp", "gap", "Mid gap bps", "Gap between mid prices; can be just the spreads")}${sortHeader("opp", "fund", "Funding spread")}${sortHeader("opp", "n", "Venues")}${sortHeader("opp", "vol", "Min 24h vol")}<th></th></tr></thead>`;
   const ob = opp.map(r => `<tr><td><div class="asset-cell"><b>${esc(r.a.label)}</b>${classTag(r.a.cls)}${jumpTag(r)}</div></td>
-      <td class="l">${esc(r.hi.exchangeLabel)}${ageTag(r.hi)} <span class="num muted ${flash("opp|hi|" + r.a.key, r.hi.price)}">${fmtPx(r.hi.price)}</span></td>
-      <td class="l">${esc(r.lo.exchangeLabel)}${ageTag(r.lo)} <span class="num muted ${flash("opp|lo|" + r.a.key, r.lo.price)}">${fmtPx(r.lo.price)}</span></td>
-      <td class="num above">${fmtBps(r.maxGap)}</td>
-      <td class="num ${r.exec > 0 ? "above" : "muted"}">${fmtBps(r.exec)}</td>
+      <td class="l">${esc(r.execPair[1].exchangeLabel)}${ageTag(r.execPair[1])} <span class="num muted ${flash("opp|hi|" + r.a.key, r.execPair[1].bid)}">${fmtPx(r.execPair[1].bid)}</span></td>
+      <td class="l">${esc(r.execPair[0].exchangeLabel)}${ageTag(r.execPair[0])} <span class="num muted ${flash("opp|lo|" + r.a.key, r.execPair[0].ask)}">${fmtPx(r.execPair[0].ask)}</span></td>
+      <td class="num ${r.exec > 0 ? "above" : "below"}">${fmtBps(r.exec)}${insideTag(r)}</td>
+      <td class="num muted">${fmtBps(r.maxGap)}</td>
       <td class="num">${r.fundSpread == null ? "–" : fmtPct(r.fundSpread)}</td>
       <td class="num">${r.ms.length}</td><td class="num">${fmtUsd(r.minVol)}</td>
       <td><button class="linkish" data-add="${esc(r.a.key)}">+ watch</button> · <button class="linkish" data-chart="${esc(r.a.key)}">chart</button></td></tr>`).join("");
@@ -1170,11 +1178,11 @@ let rsTimer; addEventListener("resize", () => { clearTimeout(rsTimer); rsTimer =
    ============================================================================================= */
 const AGENTS = [
   { id: "finder", name: "Pair finder" }, { id: "history", name: "History" }, { id: "session", name: "Session tagger" },
-  { id: "spotter", name: "Opportunity spotter" }, { id: "quality", name: "Quality guard" }, { id: "books", name: "Order-book checker" },
+  { id: "books", name: "Order-book checker" }, { id: "spotter", name: "Opportunity spotter" }, { id: "quality", name: "Quality guard" },
   { id: "sim", name: "Trade simulator" }, { id: "analyst", name: "Analyst" },
 ];
 const sc = { running: false, stop: false, agents: {}, log: [], results: [], opps: [], open: new Set(), cache: new Map(), books: new Map(),
-  sort: { col: "limit", dir: -1 }, osort: { col: "start", dir: -1 }, live: [], liveAt: 0, liveBusy: false };
+  sort: { col: "market", dir: -1 }, osort: { col: "start", dir: -1 }, live: [], liveAt: 0, liveBusy: false };
 state.sort.sc = sc.sort; state.sort.opp2 = sc.osort;
 
 function agentSay(id, msg, st = "working") {
@@ -1248,7 +1256,10 @@ async function getBook(m, maxAgeMs = 30000) {
   const v = VENUES.find(x => x.id === m.venue);
   let book = null;
   if (v?.book) book = await v.book(m);
-  else if (m.bid > 0 && m.ask > 0) book = { bids: [[m.bid, Infinity]], asks: [[m.ask, Infinity]], quoteOnly: true };   // Variational RFQ quote
+  else if (m.bid > 0 && m.ask > 0) {         // Variational RFQ: $1k quote for the first $1k, its $100k quote beyond that
+    const u1 = 1000 / ((m.bid + m.ask) / 2);
+    book = { bids: [[m.bid, u1], [m.bid100k || m.bid, Infinity]], asks: [[m.ask, u1], [m.ask100k || m.ask, Infinity]], quoteOnly: true };
+  }
   sc.books.set(m.key, { at: Date.now(), book });
   return book;
 }
@@ -1294,16 +1305,16 @@ function qualityOf(p, d, s, sess) {
 }
 
 /* ---------- 4. opportunity spotter ---------- */
-function findOpportunities(d, s, sess, gapOf) {
+function findOpportunities(d, s, sess, gapOf, need) {
   const eps = [], n = d.t.length, step = IV_MS[s.iv];
   let i = 0;
   while (i < n) {
     const g = gapOf(i);
-    if (!(d.act[i] && Math.abs(g) >= s.entry)) { i++; continue; }
+    if (!(d.act[i] && Math.abs(g) >= need(i))) { i++; continue; }
     const side = Math.sign(g); let j = i, last = i, peak = Math.abs(g);
-    // the window lasts while the gap stays on the same side and near the entry level (short dips allowed)
-    while (j + 1 < n && Math.sign(gapOf(j + 1)) === side && Math.abs(gapOf(j + 1)) >= s.entry * 0.7) {
-      j++; if (Math.abs(gapOf(j)) >= s.entry) last = j; peak = Math.max(peak, Math.abs(gapOf(j)));
+    // the window lasts while the gap stays on the same side and near the level (short dips allowed)
+    while (j + 1 < n && Math.sign(gapOf(j + 1)) === side && Math.abs(gapOf(j + 1)) >= need(j + 1) * 0.7) {
+      j++; if (Math.abs(gapOf(j)) >= need(j)) last = j; peak = Math.max(peak, Math.abs(gapOf(j)));
     }
     eps.push({ i0: i, i1: last, side, peak, start: d.t[i], end: d.t[last] + step, minutes: (d.t[last] + step - d.t[i]) / 60e3, sess: sess[i] });
     i = j + 1;
@@ -1316,11 +1327,11 @@ function closeDeadline(tMs, s) {
   if (s.closeBy === "day") { const d = new Date(tMs); d.setHours(23, 59, 0, 0); return d.getTime(); }
   return tMs + +s.closeBy * 3600e3;
 }
-function simulate(op, d, s, gapOf, costs) {
+function simulate(op, d, s, gapOf, costs, need) {
   const step = IV_MS[s.iv];
-  // you notice it and act `react` minutes after it first appears, if it is still at the entry level
+  // you notice it and act `react` minutes after it first appears, if it is still fillable at the entry level
   let e = op.i0; while (e <= op.i1 && d.t[e] - op.start < s.react * 60e3) e++;
-  while (e <= op.i1 && !(d.act[e] && Math.abs(gapOf(e)) >= s.entry)) e++;
+  while (e <= op.i1 && !(d.act[e] && Math.abs(gapOf(e)) >= need(e))) e++;
   if (e > op.i1 || e >= d.t.length - 1) return { missed: true };
   const side = op.side, deadline = closeDeadline(d.t[e], s);
   let x = -1, reason = "", best = 0, flipped = false;
@@ -1344,7 +1355,7 @@ function simulate(op, d, s, gapOf, costs) {
   // market: taker fee on 4 fills + today's book impact on both legs; limit: maker fee on 4 fills
   const mkt = costs.mktA == null || costs.mktB == null ? null : notional * (2 * (costs.takerA + costs.takerB) + (costs.mktA + costs.mktB) / 1e4);
   const lim = notional * 2 * (costs.makerA + costs.makerB);
-  return { e, x, tIn: d.t[e], tOut: d.t[x], gIn: gapOf(e), gOut: gapOf(x), q, gross, netMkt: mkt == null ? null : gross - mkt, netLim: gross - lim, costMkt: mkt, costLim: lim,
+  return { e, x, tIn: d.t[e], tOut: d.t[x], gIn: gapOf(e), gOut: gapOf(x), fillIn: Math.abs(gapOf(e)) - (need(e) - s.entry), q, gross, netMkt: mkt == null ? null : gross - mkt, netLim: gross - lim, costMkt: mkt, costLim: lim,
     hours: (d.t[x] - d.t[e]) / 3600e3, reason, sameDay: new Date(d.t[e]).toDateString() === new Date(d.t[x]).toDateString(), sess: sessionOf(d.t[e]) };
 }
 
@@ -1379,36 +1390,47 @@ async function runScan() {
           agentSay("session", `Tagging ${d.t.length} bars of ${p.a.label}`);
           const sess = d.t.map(sessionOf);
 
-          agentSay("spotter", `Looking for gaps ≥ ${s.entry} that lasted ${fmtDur(s.minWin * 60e3)} on ${label}`);
-          const eps = findOpportunities(d, s, sess, gapOf);
+          // order books first: a gap only counts if it survives selling at the bid and buying at the ask
+          agentSay("books", `Reading both order books for ${label}`);
+          let costs = { takerA: p.A.takerFee ?? 0.00045, takerB: p.B.takerFee ?? 0.00045, makerA: p.A.makerFee ?? 0.00015, makerB: p.B.makerFee ?? 0.00015, mktA: null, mktB: null };
+          const q0 = s.sizeMode === "usd" ? s.size / d.pa[d.pa.length - 1] : s.size;
+          const [ba, bb] = await Promise.all([getBook(p.A).catch(() => null), getBook(p.B).catch(() => null)]);
+          const ca2 = marketCostBps(ba, q0), cb2 = marketCostBps(bb, q0);
+          costs.mktA = ca2 && !ca2.thin ? ca2.bps : null; costs.mktB = cb2 && !cb2.thin ? cb2.bps : null;
+          const bookNote = { A: ca2, B: cb2, q: q0 };
+          // crossing both books costs half of each round trip on the way in (in bps of price)
+          const crossBps = costs.mktA != null && costs.mktB != null ? (costs.mktA + costs.mktB) / 2 : null;
+          if (crossBps == null) {
+            const thin = [[p.A, ca2], [p.B, cb2]].filter(([, c]) => !c || c.thin).map(([m]) => m.exchangeLabel).join(" and ");
+            sc.results.push({ p, label, skip: `${thin} book too thin to fill ${fmtNum(q0)} units` }); continue;
+          }
+          const need = s.unit === "bps" ? () => s.entry + crossBps : i => s.entry + crossBps / 1e4 * d.pa[i];
+
+          agentSay("spotter", `Looking for fillable gaps ≥ ${s.entry} that lasted ${fmtDur(s.minWin * 60e3)} on ${label}`);
+          const eps = findOpportunities(d, s, sess, gapOf, need);
           const real = eps.filter(o => o.minutes >= s.minWin && allow(o.start));
           const brief = eps.filter(o => o.minutes < s.minWin).length;
+          // what a mid-price scan would have shown: windows that were only the spreads
+          const midEps = findOpportunities(d, s, sess, gapOf, () => s.entry).filter(o => o.minutes >= s.minWin && allow(o.start));
+          const spreadOnly = Math.max(0, midEps.length - real.length);
 
           agentSay("quality", `Checking ${label}`);
           const qual = qualityOf(p, d, s, sess);
-
-          let costs = { takerA: p.A.takerFee ?? 0.00045, takerB: p.B.takerFee ?? 0.00045, makerA: p.A.makerFee ?? 0.00015, makerB: p.B.makerFee ?? 0.00015, mktA: null, mktB: null };
-          let bookNote = null;
-          if (real.length) {
-            agentSay("books", `Reading both order books for ${label}`);
-            const q = s.sizeMode === "usd" ? s.size / d.pa[d.pa.length - 1] : s.size;
-            const [ba, bb] = await Promise.all([getBook(p.A).catch(() => null), getBook(p.B).catch(() => null)]);
-            const ca2 = marketCostBps(ba, q), cb2 = marketCostBps(bb, q);
-            costs.mktA = ca2 && !ca2.thin ? ca2.bps : null; costs.mktB = cb2 && !cb2.thin ? cb2.bps : null;
-            bookNote = { A: ca2, B: cb2, q };
-          }
+          const absMid = d.t.map((_, i) => Math.abs((d.pb[i] / d.pa[i] - 1) * 1e4)).sort((x, y) => x - y);
+          const medGap = absMid[absMid.length >> 1];
+          if (crossBps > medGap) { qual.score = Math.max(0, qual.score - 15); qual.flags.unshift([`Crossing both books costs ${crossBps.toFixed(1)} bps, more than the typical gap (${medGap.toFixed(1)} bps): most gaps you see here are just the spreads.`, "bad"]); }
 
           agentSay("sim", `Simulating ${real.length} opportunit${real.length === 1 ? "y" : "ies"} on ${label}`);
           const trades = [];
           let missed = 0, stillOpen = 0;
           for (const op of real) {
-            const r = simulate(op, d, s, gapOf, costs);
+            const r = simulate(op, d, s, gapOf, costs, need);
             if (r.missed) { missed++; continue; }
             if (r.open) { stillOpen++; sc.opps.push({ p, label, op, open: true }); continue; }
             trades.push(r); sc.opps.push({ p, label, op, tr: r });
           }
           const conv = trades.filter(t => t.reason !== "deadline");
-          const res = { p, label, d, eps, real, brief, trades, conv, missed, stillOpen, qual, bookNote, costs,
+          const res = { p, label, d, eps, real, brief, trades, conv, missed, stillOpen, qual, bookNote, costs, crossBps, spreadOnly, medGap,
             lim: trades.reduce((x, t) => x + t.netLim, 0), mkt: trades.some(t => t.netMkt == null) ? null : trades.reduce((x, t) => x + t.netMkt, 0) };
           judge(res, s);
           sc.results.push(res);
@@ -1440,20 +1462,23 @@ function judge(r, s) {
   const minNet = 0.0025 * notional;
   if (!r.real.length) {
     r.verdict = "na";
-    why.push(r.eps.length ? `The gap reached ${s.entry} ${s.unit} ${r.eps.length} time${r.eps.length > 1 ? "s" : ""}, but never stayed ${fmtDur(s.minWin * 60e3)}${r.brief ? " (too brief to act on)" : ""}.` : `The gap never reached ${s.entry} ${s.unit} in ${s.days} days.`);
+    why.push(r.eps.length ? `After paying ${r.crossBps.toFixed(1)} bps to cross both books, the gap reached ${s.entry} ${s.unit} ${r.eps.length} time${r.eps.length > 1 ? "s" : ""} but never stayed ${fmtDur(s.minWin * 60e3)}.` : `After paying ${r.crossBps.toFixed(1)} bps to cross both books, the gap never reached ${s.entry} ${s.unit} in ${s.days} days.`);
+    if (r.spreadOnly) why.push(`${r.spreadOnly} window${r.spreadOnly > 1 ? "s" : ""} looked like ${s.entry}+ on mid prices but disappear once you sell at the bid and buy at the ask.`);
   } else {
     const conv = r.conv.length;
-    why.push(`${r.real.length} window${r.real.length > 1 ? "s" : ""} lasted over ${fmtDur(s.minWin * 60e3)}. ${t.length} could be taken after your ${s.react}-minute reaction${r.missed ? `, ${r.missed} closed before you could act` : ""}${r.stillOpen ? `, ${r.stillOpen} still open now` : ""}.`);
+    why.push(`${r.real.length} window${r.real.length > 1 ? "s" : ""} stayed fillable at ${s.entry} ${s.unit} (after paying ${r.crossBps.toFixed(1)} bps to cross both books) for over ${fmtDur(s.minWin * 60e3)}.${r.spreadOnly ? ` ${r.spreadOnly} more looked like gaps on mid prices but were only the spreads.` : ""} ${t.length} could be taken after your ${s.react}-minute reaction${r.missed ? `, ${r.missed} closed before you could act` : ""}${r.stillOpen ? `, ${r.stillOpen} still open now` : ""}.`);
     if (t.length) why.push(`${conv} of ${t.length} converged before your deadline${t.length - conv ? `; ${t.length - conv} had to be closed unconverged` : ""}. Median time to close: ${fmtDur(median(t.map(x => x.hours)) * 3600e3)}.`);
     if (t.length) why.push(`With limit orders: ${fmtUsd2(r.lim)} (${wins} of ${t.length} won). With market orders: ${r.mkt == null ? "the book is too thin to fill your size" : fmtUsd2(r.mkt)}${r.mkt != null && r.lim > 0 ? `, so taker fees and crossing the book eat ${Math.round(Math.min(999, (r.lim - r.mkt) / r.lim * 100))}% of the profit` : ""}.`);
-    const good = t.length >= 3 && r.lim >= minNet && wins / Math.max(1, t.length) >= 0.6 && r.qual.score >= 65 && !["crypto", "preipo"].includes(r.p.a.cls);
-    r.verdict = !t.length ? "na" : good && (r.mkt == null || r.mkt > 0) ? "go" : good ? "limit" : r.lim > 0 ? "watch" : "avoid";
-    if (r.verdict === "limit") why.push("Only worth it with limit orders: market orders lose the edge.");
+    const mwins = t.filter(x => x.netMkt > 0).length;
+    const clean = t.length >= 3 && wins / Math.max(1, t.length) >= 0.6 && r.qual.score >= 65 && !["crypto", "preipo"].includes(r.p.a.cls);
+    const tight = r.crossBps <= s.entry / 2;           // limits only plausible when the books are tight
+    r.verdict = !t.length ? "na" : clean && r.mkt >= minNet && mwins / t.length >= 0.6 ? "go" : clean && tight && r.lim >= minNet ? "limit" : r.lim > 0 || r.mkt > 0 ? "watch" : "avoid";
+    if (r.verdict === "limit") why.push(`Only with limit orders: market orders lose the edge. The books are tight (${r.crossBps.toFixed(1)} bps to cross), so resting limits have a fair chance to fill.`);
     if (r.verdict === "watch") why.push(t.length < 3 ? "Fewer than 3 trades: too few to trust." : r.lim < minNet ? `Under ${fmtUsd(minNet)} (0.25% of your size) over ${s.days} days: too small for the risk.` : r.qual.score < 65 ? "The quality guard is worried (see flags)." : wins / t.length < 0.6 ? "Fewer than 60% of trades won." : "The asset type is risky.");
   }
   if (r.bookNote) {
     const b = (m, c) => !c ? `${m.exchangeLabel}: no book` : c.thin ? `${m.exchangeLabel}: too thin for ${fmtNum(r.bookNote.q)} units (only ${fmtUsd(c.depthUsd)} within 0.25%)` : `${m.exchangeLabel}: spread ${c.spreadBps.toFixed(1)} bps, market round trip ${c.bps.toFixed(1)} bps, ${fmtUsd(c.depthUsd)} within 0.25%`;
-    why.push(`Order books now. ${b(r.p.A, r.bookNote.A)}. ${b(r.p.B, r.bookNote.B)}.`);
+    why.push(`Order books now (${new Date().toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" })}). ${b(r.p.A, r.bookNote.A)}. ${b(r.p.B, r.bookNote.B)}.${sessionOf(Date.now()) === "weekend" ? " Weekend books are usually wider than weekday ones, so weekday results here are on the cautious side." : ""}`);
   }
   r.why = why;
 }
@@ -1469,26 +1494,28 @@ function dailySummary(s) {
   const unit = s.unit === "bps" ? "bps" : "points";
   const lines = days.map((d, k) => {
     const key = dayKey(d.getTime());
-    const list = taken.filter(o => dayKey(o.tr.tIn) === key).sort((a, b) => b.tr.netLim - a.tr.netLim);
+    const list = taken.filter(o => dayKey(o.tr.tIn) === key).sort((a, b) => (b.tr.netMkt ?? -1e9) - (a.tr.netMkt ?? -1e9));
     const openNow = sc.opps.filter(o => o.open && dayKey(o.op.start) === key);
     const name = k === 0 ? "Today" : k === 1 ? "Yesterday" : d.toLocaleDateString(undefined, { weekday: "long" });
     const date = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
     const wk = sessionOf(d.getTime()) === "weekend" || [0, 6].includes(d.getDay());
-    if (!list.length) return `<p><b>${name} (${date}).</b> No gap of ${s.entry} ${unit} lasted ${fmtDur(s.minWin * 60e3)} on the pairs scanned${openNow.length ? `; ${openNow.length} window${openNow.length > 1 ? "s are" : " is"} open right now (${openNow.map(o => esc(o.p.a.label)).join(", ")})` : ""}.${wk ? " Stock, index, FX and commodity markets are shut at the weekend, so their perps drift without an outside price; gaps then are less reliable." : ""}</p>`;
+    if (!list.length) return `<p><b>${name} (${date}).</b> No gap stayed fillable at ${s.entry} ${unit} (after crossing both books) for ${fmtDur(s.minWin * 60e3)} on the pairs scanned${openNow.length ? `; ${openNow.length} window${openNow.length > 1 ? "s are" : " is"} open right now (${openNow.map(o => esc(o.p.a.label)).join(", ")})` : ""}.${wk ? " Stock, index, FX and commodity markets are shut at the weekend, so their perps drift without an outside price; gaps then are less reliable." : ""}</p>`;
     const sum = list.reduce((x, o) => x + o.tr.netLim, 0), sumM = list.every(o => o.tr.netMkt != null) ? list.reduce((x, o) => x + o.tr.netMkt, 0) : null;
     const conv = list.filter(o => o.tr.reason !== "deadline").length;
     const b = list[0], t = b.tr;
     const rich = t.gIn > 0 ? b.p.B.exchangeLabel : b.p.A.exchangeLabel, cheap = t.gIn > 0 ? b.p.A.exchangeLabel : b.p.B.exchangeLabel;
-    const others = list.slice(1, 3).map(o => `${esc(o.p.a.label)} (${fmtUsd2(o.tr.netLim)})`).join(", ");
-    return `<p><b>${name} (${date}).</b> ${list.length} opportunit${list.length > 1 ? "ies" : "y"} you could have acted on, ${conv} closed at your exit level the same day. ` +
-      `Best: <b>${esc(b.p.a.label)}</b>, ${esc(rich)} above ${esc(cheap)} by ${Math.abs(t.gIn).toFixed(1)} ${unit} at ${fmtClock(t.tIn).slice(0, 5)} (peak ${b.op.peak.toFixed(1)}), ` +
+    const others = list.slice(1, 3).map(o => `${esc(o.p.a.label)} (${o.tr.netMkt == null ? "book too thin" : fmtUsd2(o.tr.netMkt)})`).join(", ");
+    return `<p><b>${name} (${date}).</b> ${list.length} opportunit${list.length > 1 ? "ies" : "y"} that stayed fillable after crossing both books, ${conv} closed at your exit level the same day. ` +
+      `Best: <b>${esc(b.p.a.label)}</b>, sell ${esc(rich)} / buy ${esc(cheap)} at ${fmtClock(t.tIn).slice(0, 5)}: ${Math.abs(t.gIn).toFixed(1)} ${unit} apart, ${t.fillIn.toFixed(1)} after crossing the books (peak ${b.op.peak.toFixed(1)}), ` +
       `${t.reason === "deadline" ? `still ${Math.abs(t.gOut).toFixed(1)} apart at your deadline` : t.reason === "rode the flip" ? `flipped and you rode it to ${(-Math.sign(t.gIn) * t.gOut).toFixed(1)} the other way` : t.reason === "flipped" ? `flipped to ${Math.abs(t.gOut).toFixed(1)} the other way after ${fmtDur(t.hours * 3600e3)} (you gain the full swing)` : `back to ${Math.abs(t.gOut).toFixed(1)} after ${fmtDur(t.hours * 3600e3)}`}: ` +
-      `${fmtUsd2(t.netLim)} with limit orders${t.netMkt != null ? `, ${fmtUsd2(t.netMkt)} with market orders` : ""}.` +
-      `${others ? ` Also ${others}.` : ""} All together ${fmtUsd2(sum)} with limits${sumM != null ? ` or ${fmtUsd2(sumM)} with market orders` : ""}.${wk ? " Weekend: the underlying markets were shut, so these perps had no outside price. Treat them with care." : ""}</p>`;
+      `${t.netMkt != null ? `${fmtUsd2(t.netMkt)} with market orders` : "book too thin for market orders"} (${fmtUsd2(t.netLim)} if limit orders had filled).` +
+      `${others ? ` Also ${others}.` : ""} All together ${sumM != null ? `${fmtUsd2(sumM)} with market orders` : "n/a with market orders"} (${fmtUsd2(sum)} with limits, if filled).${wk ? " Weekend: the underlying markets were shut, so these perps had no outside price. Treat them with care." : ""}</p>`;
   });
   const all = taken.reduce((x, o) => x + o.tr.netLim, 0);
+  const allM = taken.every(o => o.tr.netMkt != null) ? taken.reduce((x, o) => x + o.tr.netMkt, 0) : null;
+  const fake = sc.results.filter(r => !r.skip).reduce((x, r) => x + (r.spreadOnly || 0), 0);
   const pairsGo = sc.results.filter(r => r.verdict === "go" || r.verdict === "limit");
-  const lead = `<p class="muted">${taken.length} opportunities over the last ${s.days} days across ${sc.results.filter(r => !r.skip).length} pairs, worth ${fmtUsd2(all)} with limit orders at ${s.sizeMode === "usd" ? fmtUsd(s.size) : s.size + " units"} per leg. ${pairsGo.length ? `Pairs that passed every check: ${pairsGo.sort((a, b) => b.lim - a.lim).slice(0, 6).map(r => esc(r.p.a.label) + " (" + esc(r.p.A.exchangeLabel) + " / " + esc(r.p.B.exchangeLabel) + (r.verdict === "limit" ? ", limit orders only" : "") + ")").join(", ")}.` : "No pair passed every check."} Prices are last trades on 5-minute bars, so check the live books before you act.</p>`;
+  const lead = `<p class="muted">${taken.length} opportunities over the last ${s.days} days across ${sc.results.filter(r => !r.skip).length} pairs that stayed fillable after selling at the bid and buying at the ask: ${allM == null ? "n/a" : fmtUsd2(allM)} with market orders, ${fmtUsd2(all)} if limit orders had filled, at ${s.sizeMode === "usd" ? fmtUsd(s.size) : s.size + " units"} per leg.${fake ? ` ${fake} more windows looked like gaps on mid prices but were only the spreads, and were thrown out.` : ""} ${pairsGo.length ? `Pairs that passed every check: ${pairsGo.sort((a, b) => b.lim - a.lim).slice(0, 6).map(r => esc(r.p.a.label) + " (" + esc(r.p.A.exchangeLabel) + " / " + esc(r.p.B.exchangeLabel) + (r.verdict === "limit" ? ", limit orders only" : "") + ")").join(", ")}.` : "No pair passed every check."} Prices are last trades on 5-minute bars, so check the live books before you act.</p>`;
   return lead + lines.join("");
 }
 
@@ -1505,8 +1532,9 @@ function renderScanResults() {
     k("Pairs scanned", rs.length, `${sc.results.length - rs.length} skipped`) +
     k("Windows ≥ " + fmtDur(s.minWin * 60e3), rs.reduce((x, r) => x + r.real.length, 0), `${rs.reduce((x, r) => x + r.brief, 0)} more were too brief`) +
     k("Opportunities taken", taken.length, `${taken.filter(o => o.tr.reason !== "deadline").length} converged in time`) +
-    k("With limit orders", fmtUsd2(lim), "maker fees only, if your limits fill", lim > 0 ? "above" : "") +
-    k("With market orders", mk == null ? "–" : fmtUsd2(mk), "taker fees + today's book impact", mk > 0 ? "above" : mk < 0 ? "below" : "") : "";
+    k("With market orders", mk == null ? "–" : fmtUsd2(mk), "sell at the bid, buy at the ask, taker fees", mk > 0 ? "above" : mk < 0 ? "below" : "") +
+    k("If limit orders filled", fmtUsd2(lim), "maker fees only; not guaranteed on thin books", "muted") +
+    k("Spread-only windows thrown out", rs.reduce((x, r) => x + (r.spreadOnly || 0), 0), "looked like gaps on mid prices") : "";
 
   // per-pair table
   const getters = { pair: r => r.label, cls: r => r.p.a.cls, score: r => r.qual.score, win: r => r.real.length, taken: r => r.trades.length,
@@ -1515,8 +1543,8 @@ function renderScanResults() {
   const head = `<thead><tr>${sortHeader("sc", "pair", "Pair")}${sortHeader("sc", "cls", "Type")}${sortHeader("sc", "verdict", "Verdict")}${sortHeader("sc", "score", "Quality")}
     ${sortHeader("sc", "win", "Windows", "Gaps at your entry level that lasted at least your minimum time")}${sortHeader("sc", "taken", "Taken", "Windows still open after your reaction time")}
     ${sortHeader("sc", "conv", "Converged", "Share that reached your exit level before the deadline")}
-    ${sortHeader("sc", "limit", "Net, limit $")}${sortHeader("sc", "market", "Net, market $")}<th class="l">Books now</th></tr></thead>`;
-  const bk = r => !r.bookNote ? `<span class="muted">not needed</span>` : [r.bookNote.A, r.bookNote.B].map(c => !c ? "no book" : c.thin ? `<span class="above">too thin</span>` : `${c.bps.toFixed(1)} bps`).join(" / ");
+    ${sortHeader("sc", "market", "Net, market $", "Sell at the bid, buy at the ask, taker fees: what you can count on")}${sortHeader("sc", "limit", "Limit $, if filled", "Maker fees only; assumes your resting orders fill")}<th class="l" title="Cost to buy and sell your size on each book right now">Books now</th></tr></thead>`;
+  const bk = r => !r.bookNote ? `<span class="muted">–</span>` : [r.bookNote.A, r.bookNote.B].map(c => !c ? "no book" : c.thin ? `<span class="above">too thin</span>` : `${c.bps.toFixed(1)}`).join(" / ") + " bps";
   const body = rows.map(r => {
     const id = r.p.A.key + "~" + r.p.B.key, open = sc.open.has(id);
     const nf = r.qual.flags.filter(f => f[1] !== "info").length;
@@ -1526,8 +1554,8 @@ function renderScanResults() {
       <td class="num ${r.qual.score >= 65 ? "" : "above"}">${r.qual.score}${nf ? ` <span class="tag stale">${nf} flag${nf > 1 ? "s" : ""}</span>` : ""}</td>
       <td class="num">${r.real.length}</td><td class="num">${r.trades.length}</td>
       <td class="num">${r.trades.length ? Math.round(r.conv.length / r.trades.length * 100) + "%" : "–"}</td>
-      <td class="num ${r.lim > 0 ? "above" : r.lim < 0 ? "below" : ""}">${r.trades.length ? fmtUsd2(r.lim) : "–"}</td>
       <td class="num ${r.mkt > 0 ? "above" : r.mkt < 0 ? "below" : ""}">${r.trades.length ? (r.mkt == null ? "book too thin" : fmtUsd2(r.mkt)) : "–"}</td>
+      <td class="num muted">${r.trades.length ? fmtUsd2(r.lim) : "–"}</td>
       <td class="l num">${bk(r)}</td></tr>`;
     if (open) {
       html += `<tr class="sc-detail"><td colspan="10"><div style="display:grid;gap:4px;max-width:1000px">
@@ -1553,7 +1581,7 @@ function oppTable(list, s, withPair) {
   if (!rows.length) return withPair ? `<table><tbody><tr><td class="empty">${sc.running ? "Agents are working…" : "No opportunities yet."}</td></tr></tbody></table>` : "";
   const sh = (c, l, t) => sortHeader("opp2", c, l, t);
   return `<div class="table-wrap"><table><thead><tr>${sh("start", "Gap opened")}${withPair ? sh("pair", "Pair") : ""}<th class="l">Rich venue</th>${sh("peak", "Peak " + unit)}${sh("lasted", "Lasted")}
-    <th>In / out ${unit}</th>${sh("hold", "Held")}<th class="l">Outcome</th>${sh("limit", "Limit $")}${sh("market", "Market $")}<th class="l">Session</th></tr></thead><tbody>` +
+    <th title="Mid gap at entry → at exit; the fillable gap at entry is in the trade's reasons">In / out ${unit}</th>${sh("hold", "Held")}<th class="l">Outcome</th>${sh("market", "Market $")}${sh("limit", "Limit $, if filled")}<th class="l">Session</th></tr></thead><tbody>` +
     rows.map(o => {
       const t = o.tr, rich = o.op.side > 0 ? o.p.B.exchangeLabel : o.p.A.exchangeLabel;
       return `<tr><td class="num">${fmtTime(o.op.start)}</td>${withPair ? `<td><div class="asset-cell"><b>${esc(o.p.a.label)}</b><span class="muted">${esc(o.p.A.exchangeLabel)} / ${esc(o.p.B.exchangeLabel)}</span></div></td>` : ""}
@@ -1561,8 +1589,8 @@ function oppTable(list, s, withPair) {
         <td class="num">${t ? `${Math.abs(t.gIn).toFixed(1)} → ${(t.gOut * Math.sign(t.gIn)).toFixed(1)}` : "–"}</td>
         <td class="num">${t ? fmtDur(t.hours * 3600e3) : "–"}</td>
         <td class="l">${o.open ? "<b>still open</b>" : { converged: "closed at exit", flipped: "flipped, closed", "rode the flip": "rode the flip", deadline: "<span class=\"above\">deadline, not converged</span>" }[t.reason]}${t && !t.sameDay ? " · next day" : ""}</td>
-        <td class="num ${t && t.netLim > 0 ? "above" : t && t.netLim < 0 ? "below" : ""}">${t ? fmtUsd2(t.netLim) : "–"}</td>
         <td class="num ${t && t.netMkt > 0 ? "above" : t && t.netMkt < 0 ? "below" : ""}">${t ? (t.netMkt == null ? "too thin" : fmtUsd2(t.netMkt)) : "–"}</td>
+        <td class="num muted">${t ? fmtUsd2(t.netLim) : "–"}</td>
         <td class="l">${{ us: "US hours", off: "overnight", weekend: "weekend" }[o.op.sess]}</td></tr>`;
     }).join("") + "</tbody></table></div>";
 }
@@ -1583,31 +1611,39 @@ document.getElementById("view-scanner").addEventListener("click", e => {
   renderScanResults();
 });
 
-/* ---------- live check: gaps open right now, priced off the books for your size ---------- */
+/* ---------- live check: gaps open right now, priced off the books for your size ----------
+   The gap that matters is SELL the rich venue at its bid and BUY the cheap venue at its ask,
+   walking each book for your size. Mid-price gaps that vanish inside the spreads are shown last. */
 async function liveCheck(force) {
   if (sc.liveBusy || (!force && Date.now() - sc.liveAt < 30000)) return;
   sc.liveBusy = true;
   const s = scSettings();
   try {
-    const cands = [...state.views.values()].filter(v => (TYPE_SETS[s.types] ? TYPE_SETS[s.types].includes(v.a.cls) : true) && v.ms.length >= 2 && v.minVol >= s.minVol && v.hi && v.lo
-      && (s.unit === "bps" ? v.maxGap : v.hi.price - v.lo.price) >= s.entry).sort((a, b) => b.maxGap - a.maxGap).slice(0, 8);
+    const set = TYPE_SETS[s.types];
+    const cands = [...state.views.values()].filter(v => (!set || set.includes(v.a.cls)) && v.ms.length >= 2 && v.minVol >= s.minVol && v.hi && v.lo
+      && (s.unit === "bps" ? v.maxGap : v.hi.price - v.lo.price) >= s.entry).sort((a, b) => (b.exec ?? -1e9) - (a.exec ?? -1e9)).slice(0, 10);
     const out = [];
     for (const v of cands) {
-      const q = s.sizeMode === "usd" ? s.size / v.lo.price : s.size;
-      const [bh, bl] = await Promise.all([getBook(v.hi, 15000).catch(() => null), getBook(v.lo, 15000).catch(() => null)]);
+      // trade direction from the mid gap: sell the venue priced higher, buy the one priced lower
+      const rich = v.hi, cheap = v.lo;
+      const q = s.sizeMode === "usd" ? s.size / cheap.price : s.size;
+      const [bh, bl] = await Promise.all([getBook(rich, 15000).catch(() => null), getBook(cheap, 15000).catch(() => null)]);
       const ch = marketCostBps(bh, q), cl = marketCostBps(bl, q);
-      // what you would actually get now with market orders: sell q on the rich book, buy q on the cheap book
-      const sellRich = bh ? walk(bh.bids, q) : null, buyCheap = bl ? walk(bl.asks, q) : null;
-      const execBps = sellRich && buyCheap ? (sellRich / buyCheap - 1) * 1e4 : null;
-      const fees = 2 * ((v.hi.takerFee ?? 0.00045) + (v.lo.takerFee ?? 0.00045)) * 1e4;            // 4 taker fills, bps
-      const lfee = 2 * ((v.hi.makerFee ?? 0.00015) + (v.lo.makerFee ?? 0.00015)) * 1e4;
-      const notional = q * v.lo.price;
-      // closing later costs about the other half of each book's round trip
-      const exitHalf = ch && cl && !ch.thin && !cl.thin ? (ch.bps + cl.bps) / 2 : null;
-      out.push({ v, q, ch, cl, execBps, fees, lfee, notional,
-        mktEdge: execBps != null && exitHalf != null ? execBps - s.exit - exitHalf - fees : null,
-        limEdge: v.maxGap - s.exit - lfee });
+      const sellAt = bh ? walk(bh.bids, q) : null, buyAt = bl ? walk(bl.asks, q) : null;
+      const fillBps = sellAt && buyAt ? (sellAt / buyAt - 1) * 1e4 : null;
+      const fees = 2 * ((rich.takerFee ?? 0.00045) + (cheap.takerFee ?? 0.00045)) * 1e4;   // 4 taker fills
+      const exitCross = ch && cl && !ch.thin && !cl.thin ? (ch.bps + cl.bps) / 2 : null;      // closing crosses again
+      const edge = fillBps != null && exitCross != null ? fillBps - s.exit - exitCross - fees : null;
+      const notional = q * cheap.price;
+      const verdict = fillBps == null ? ["thin", "Book too thin for your size"]
+        : fillBps <= 0 ? ["no", "Not a trade: the gap is inside the spreads"]
+        : fillBps < s.entry ? ["no", `Fills at only ${fillBps.toFixed(1)} bps, below your ${s.entry}`]
+        : edge <= 0 ? ["no", "Costs eat it: closing later costs more than is left"]
+        : Math.max(ageOf(rich), ageOf(cheap)) > 10 ? ["thin", `Check first: ${(ageOf(rich) > ageOf(cheap) ? rich : cheap).exchangeLabel} quote is ${Math.round(Math.max(ageOf(rich), ageOf(cheap)))} s old`]
+        : ["yes", "Fillable now"];
+      out.push({ v, rich, cheap, q, ch, cl, sellAt, buyAt, fillBps, fees, exitCross, edge, notional, verdict });
     }
+    out.sort((a, b) => (b.edge ?? -1e9) - (a.edge ?? -1e9));
     sc.live = out; sc.liveAt = Date.now();
   } finally { sc.liveBusy = false; renderLive(); }
 }
@@ -1616,16 +1652,19 @@ function renderLive() {
   const el = document.getElementById("scLive");
   if (!sc.liveAt) { el.innerHTML = `<tbody><tr><td class="empty">Checking the books…</td></tr></tbody>`; return; }
   document.getElementById("scLiveAt").textContent = "Checked " + fmtClock(sc.liveAt) + ". Refreshes every 30 s while this page is open.";
-  if (!sc.live.length) { el.innerHTML = `<tbody><tr><td class="empty">No gap of ${s.entry} ${s.unit} open right now on the selected asset types.</td></tr></tbody>`; return; }
+  if (!sc.live.length) { el.innerHTML = `<tbody><tr><td class="empty">No gap of ${s.entry} ${s.unit} on mid prices right now on the selected asset types.</td></tr></tbody>`; return; }
   const bk = c => !c ? "no book" : c.thin ? `<span class="above">too thin (${fmtUsd(c.depthUsd)} near mid)</span>` : `${c.spreadBps.toFixed(1)} spread · ${c.bps.toFixed(1)} round trip${c.quoteOnly ? " (quote)" : ""}`;
-  el.innerHTML = `<thead><tr><th>Asset</th><th class="l">Sell (rich)</th><th class="l">Buy (cheap)</th><th>Gap now bps</th><th>Fill now bps</th><th class="l">Rich book</th><th class="l">Cheap book</th><th>Edge, market</th><th>Edge, limit</th></tr></thead><tbody>` +
+  el.innerHTML = `<thead><tr><th>Asset</th><th class="l">Verdict</th><th class="l">Sell (rich) at bid</th><th class="l">Buy (cheap) at ask</th><th title="Gap between mid prices">Mid gap</th><th title="Selling your size into the rich bid and buying it from the cheap ask">Fill gap</th><th class="l">Rich book</th><th class="l">Cheap book</th><th title="Fill gap minus your exit level, the cost of crossing back, and 4 taker fees">Edge after costs</th></tr></thead><tbody>` +
     sc.live.map(x => {
       const usd = b => b == null ? "–" : `${b > 0 ? "+" : ""}${b.toFixed(1)} bps <span class="muted">(${fmtUsd2(b / 1e4 * x.notional)})</span>`;
       return `<tr><td><div class="asset-cell"><b>${esc(x.v.a.label)}</b>${classTag(x.v.a.cls)}${jumpTag(x.v)}</div></td>
-      <td class="l">${esc(x.v.hi.exchangeLabel)}${ageTag(x.v.hi)}</td><td class="l">${esc(x.v.lo.exchangeLabel)}${ageTag(x.v.lo)}</td>
-      <td class="num above">${fmtBps(x.v.maxGap)}</td><td class="num">${x.execBps == null ? "–" : fmtBps(x.execBps)}</td>
+      <td class="l"><span class="pill ${x.verdict[0] === "yes" ? "go" : x.verdict[0] === "thin" ? "watch" : "avoid"}">${esc(x.verdict[1])}</span></td>
+      <td class="l">${esc(x.rich.exchangeLabel)}${ageTag(x.rich)} <span class="num muted">${x.sellAt ? fmtPx(x.sellAt) : "–"}</span></td>
+      <td class="l">${esc(x.cheap.exchangeLabel)}${ageTag(x.cheap)} <span class="num muted">${x.buyAt ? fmtPx(x.buyAt) : "–"}</span></td>
+      <td class="num muted">${fmtBps(x.v.maxGap)}</td>
+      <td class="num ${x.fillBps > 0 ? "above" : "below"}">${x.fillBps == null ? "–" : fmtBps(x.fillBps)}</td>
       <td class="l num">${bk(x.ch)}</td><td class="l num">${bk(x.cl)}</td>
-      <td class="num ${x.mktEdge > 0 ? "above" : "below"}">${usd(x.mktEdge)}</td><td class="num ${x.limEdge > 0 ? "above" : "below"}">${usd(x.limEdge)}</td></tr>`;
+      <td class="num ${x.edge > 0 ? "above" : "below"}">${usd(x.edge)}</td></tr>`;
     }).join("") + "</tbody>";
 }
 document.getElementById("scLiveBtn").addEventListener("click", () => liveCheck(true));
