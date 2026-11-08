@@ -77,18 +77,18 @@ const hyperliquid = {
       if (r.status !== "fulfilled") continue;
       const [dex, [meta, ctxs]] = r.value;
       this.uni[dex] = meta.universe.map(a => ({ name: a.name, delisted: !!a.isDelisted }));
-      meta.universe.forEach((a, i) => { if (!a.isDelisted && ctxs[i]) { this.applyCtx(feed, dex, a.name, ctxs[i], true, this.feeOf(dex, a)); n++; } });
+      meta.universe.forEach((a, i) => { if (!a.isDelisted && ctxs[i]) { this.applyCtx(feed, dex, a.name, ctxs[i], true, this.feeOf(dex, a), this.feeOf(dex, a, 0.00015)); n++; } });
     }
     if (!n) throw new Error("no markets returned");
   },
   exOf(dex) { return dex ? "hl-" + dex : "hl"; },
   // taker fee per fill, from the Hyperliquid fee docs: builder dexes scale the base fee, growth mode cuts it 90 %
-  feeOf(dex, a) {
-    if (!dex) return 0.00045;
+  feeOf(dex, a, base = 0.00045) {   // base 0.00045 = taker, 0.00015 = maker (tier 0)
+    if (!dex) return base;
     const s = +a.deployerFeeScale || 0;
-    return 0.00045 * (s < 1 ? s + 1 : s * 2) * (a.growthMode === "enabled" ? 0.1 : 1);
+    return base * (s < 1 ? s + 1 : s * 2) * (a.growthMode === "enabled" ? 0.1 : 1);
   },
-  applyCtx(feed, dex, name, c, first, fee) {
+  applyCtx(feed, dex, name, c, first, fee, makerFee) {
     const imp = c.impactPxs || [];
     const mark = +c.markPx, mid = c.midPx != null ? +c.midPx : mark;
     const m = {
@@ -99,7 +99,7 @@ const hyperliquid = {
     if (first) Object.assign(m, {
       exchangeLabel: dex ? "HL " + dex : "HL main",
       exchangeTitle: dex ? `Hyperliquid builder dex "${dex}" (${this.names[dex]})` : "Hyperliquid validator-operated perps",
-      ticker: name.split(":").pop(), hist: { coin: name }, takerFee: fee ?? 0.00045, hlDex: dex,
+      ticker: name.split(":").pop(), hist: { coin: name }, takerFee: fee ?? 0.00045, makerFee: makerFee ?? 0.00015, hlDex: dex,
     });
     feed.upsert(m);
   },
@@ -139,6 +139,10 @@ const hyperliquid = {
     // fallback: if the socket is down, poll REST every 15 s
     setInterval(() => { if (!this.sock.isOpen()) { boot(); feed.status("fallback", "WebSocket down, polling REST"); } }, 15000);
   },
+  async book(m) {                    // full L2 book: [[px, size]...] bids high->low, asks low->high
+    const lv = (await getJSON(HL_REST, { type: "l2Book", coin: m.id })).levels;
+    return { bids: lv[0].map(l => [+l.px, +l.sz]), asks: lv[1].map(l => [+l.px, +l.sz]) };
+  },
   async candles(m, iv, startMs, endMs) {
     const c = await getJSON(HL_REST, { type: "candleSnapshot", req: { coin: m.hist.coin, interval: iv, startTime: startMs, endTime: endMs } });
     return c.map(x => [x.t, +x.c, +x.h, +x.l, +x.n > 0]);
@@ -157,7 +161,7 @@ const lighter = {
       this.perps.set(String(m.market_id), m.symbol);
       feed.upsert({
         exchange: "lighter", exchangeLabel: "Lighter", exchangeTitle: "Lighter (zk order book)",
-        id: String(m.market_id), ticker: m.symbol, hist: { marketId: m.market_id }, takerFee: 0,   // Standard account: 0 fees
+        id: String(m.market_id), ticker: m.symbol, hist: { marketId: m.market_id }, takerFee: 0, makerFee: 0,   // Standard account: 0 fees
         lighterCat: { strategy: m.strategy_index, fpm: m.funding_premium_multiplier },
         price: +m.last_trade_price || null, volume24h: +m.daily_quote_token_volume, oiUsd: +m.open_interest_usd || null,
       });
@@ -201,6 +205,11 @@ const lighter = {
         feed.status("fallback", "WebSocket down, polling REST");
       } catch (e) { feed.status("err", e.message); }
     }, 15000);
+  },
+  async book(m) {
+    const r = await getJSON(`${LT_REST}/orderBookOrders?market_id=${m.id}&limit=100`);
+    const side = arr => arr.map(o => [+o.price, +o.remaining_base_amount]);
+    return { bids: side(r.bids || []).sort((a, b) => b[0] - a[0]), asks: side(r.asks || []).sort((a, b) => a[0] - b[0]) };
   },
   async candles(m, iv, startMs, endMs) {
     const step = IV_MS[iv] / 1000;
@@ -724,7 +733,7 @@ document.addEventListener("click", e => {
   const th = e.target.closest("th[data-sort]"); if (!th) return;
   const t = th.dataset.table, col = th.dataset.sort, s = state.sort[t];
   state.sort[t] = s && s.col === col ? { col, dir: -s.dir } : { col, dir: -1 };
-  if (t === "sc") { renderScanResults(); return; }
+  if (t === "sc" || t === "opp2") { renderScanResults(); return; }
   renderCurrent();
 });
 function applySort(rows, key, getters) {
@@ -763,7 +772,7 @@ function renderCurrent() {
   else if (currentTab === "funding") renderFunding();
   else if (currentTab === "divergence") { renderDvSelectors(); dvLiveTick(); }
   else if (currentTab === "venues") renderVenues();
-  else if (currentTab === "scanner") { if (!sc.agents.finder) { renderAgents(); renderScanResults(); scRuleHint(); } }
+  else if (currentTab === "scanner") { if (!sc.agents.finder) { renderAgents(); renderScanResults(); scRuleHint(); } liveCheck(false); }
 }
 
 /* ---------- dashboard ---------- */
@@ -1150,21 +1159,23 @@ function dvLiveTick() {
 let rsTimer; addEventListener("resize", () => { clearTimeout(rsTimer); rsTimer = setTimeout(() => { mon.series = null; dv.data && drawDivergence(true); }, 200); });
 
 /* =============================================================================================
-   ARB SCANNER — a pipeline of six agents. They run in this browser on the venues' public data.
-   They are rule-based analysts (no chat model): each does one job and hands its result on.
-     1 Pair finder      which same-asset pairs on two venues are worth testing
-     2 History          downloads candles for both legs
-     3 Session tagger   marks every bar: US market hours, overnight, or weekend
-     4 Quality guard    looks for one-venue spikes, stale books, permanent premiums, risky asset types
-     5 Backtester       replays your entry/exit rule bar by bar, with fees and slippage
-     6 Judge            turns all of that into Tradeable / Watch / Avoid, with reasons
+   ARB SCANNER — follows the trader's rule:
+     1. the gap between two venues reaches the entry level (about 10)
+     2. it STAYS there long enough to act on (default 1 hour), and you need a little time to react
+     3. you sell the rich venue, buy the cheap one, and close the moment the gap shrinks to the exit
+        level (or flips) — ideally the same day
+     4. costs come from the real order books: market orders pay taker fees and walk the book,
+        limit orders pay maker fees but may not fill on a thin book
+   Eight rule-based agents (no chat model) run in this browser on the venues' public data.
    ============================================================================================= */
 const AGENTS = [
   { id: "finder", name: "Pair finder" }, { id: "history", name: "History" }, { id: "session", name: "Session tagger" },
-  { id: "quality", name: "Quality guard" }, { id: "backtest", name: "Backtester" }, { id: "judge", name: "Judge" },
+  { id: "spotter", name: "Opportunity spotter" }, { id: "quality", name: "Quality guard" }, { id: "books", name: "Order-book checker" },
+  { id: "sim", name: "Trade simulator" }, { id: "analyst", name: "Analyst" },
 ];
-const sc = { running: false, stop: false, agents: {}, log: [], results: [], open: new Set(), cache: new Map(), sort: { col: "net", dir: -1 } };
-state.sort.sc = sc.sort;
+const sc = { running: false, stop: false, agents: {}, log: [], results: [], opps: [], open: new Set(), cache: new Map(), books: new Map(),
+  sort: { col: "limit", dir: -1 }, osort: { col: "start", dir: -1 }, live: [], liveAt: 0, liveBusy: false };
+state.sort.sc = sc.sort; state.sort.opp2 = sc.osort;
 
 function agentSay(id, msg, st = "working") {
   sc.agents[id] = { msg, st };
@@ -1187,21 +1198,20 @@ function scSettings() {
   return {
     types: g("scTypes").value, scope: g("scScope").value, iv: g("scIv").value, days: +g("scDays").value,
     unit: g("scUnit").value, entry: +g("scEntry").value, exit: +g("scExit").value,
-    sizeMode: g("scSizeMode").value, size: +g("scSize").value, slip: +g("scCost").value,
-    holdH: +g("scHold").value, session: g("scSession").value, minVol: +g("scMinVol").value,
+    minWin: +g("scWindow").value, react: +g("scReact").value, closeBy: g("scCloseBy").value, flip: g("scFlip").value, trail: +g("scTrail").value,
+    sizeMode: g("scSizeMode").value, size: +g("scSize").value, minVol: +g("scMinVol").value, session: g("scSession").value,
   };
 }
 function scRuleHint() {
   const s = scSettings(), sp = [...state.markets.values()].find(m => canonOf(m.ticker || "") === "SP500" && m.price > 0);
   const el = document.getElementById("scRuleHint");
-  if (s.unit === "bps") {
-    el.textContent = sp ? `With SP500 near ${fmtPx(sp.price)}, ${s.entry} bps is about ${(sp.price * s.entry / 1e4).toFixed(1)} points and ${s.exit} bps about ${(sp.price * s.exit / 1e4).toFixed(1)} points. Your old trade (enter at 7–10 points, exit at 2–3) is roughly 10 bps in, 3 bps out.` : "";
-  } else {
-    el.textContent = "Price points are the raw price difference, the way you traded SP500 (enter at 7–10, exit at 2–3). Points only make sense when you scan one asset at a time, so use Watchlist only with a single asset, or switch to bps.";
-  }
+  const base = `Open when the gap reaches ${s.entry} ${s.unit === "bps" ? "bps" : "points"} and has stayed there at least ${fmtDur(s.minWin * 60e3)} (you act ${s.react} min after it first appears). Close when it shrinks to ${s.exit} or flips${s.flip === "ride" ? `, or ride a flip until it gives back ${s.trail}` : ""}, ${{ day: "before the day ends (your local midnight)", "12": "within 12 hours", "24": "within 24 hours" }[s.closeBy]}. `;
+  el.textContent = base + (s.unit === "bps" && sp ? `With SP500 near ${fmtPx(sp.price)}, ${s.entry} bps ≈ ${(sp.price * s.entry / 1e4).toFixed(1)} points and ${s.exit} bps ≈ ${(sp.price * s.exit / 1e4).toFixed(1)} points.`
+    : s.unit === "pts" ? "Price points are raw price differences; use them with one asset at a time (Watchlist only)." : "");
 }
-["scUnit", "scEntry", "scExit"].forEach(id => document.getElementById(id).addEventListener("input", scRuleHint));
+["scUnit", "scEntry", "scExit", "scWindow", "scReact", "scCloseBy", "scFlip", "scTrail"].forEach(id => document.getElementById(id).addEventListener("input", scRuleHint));
 document.getElementById("scSizeMode").addEventListener("change", e => { document.getElementById("scSize").value = e.target.value === "usd" ? 10000 : 10; });
+document.getElementById("scFlip").addEventListener("change", e => { document.getElementById("scTrailWrap").hidden = e.target.value !== "ride"; });
 
 /* ---------- 1. pair finder ---------- */
 function findPairs(s) {
@@ -1231,80 +1241,126 @@ async function getCandles(m, iv, days) {
   return rows;
 }
 
-/* ---------- 4. quality guard ---------- */
-function halfLifeHours(ts, gap) {
-  const hourly = new Map();
-  ts.forEach((t, i) => hourly.set(Math.floor(t / 3600e3), gap[i]));
-  const g = [...hourly.values()];
-  if (g.length < 48) return null;
-  const x = g.slice(0, -1), y = g.slice(1).map((v, i) => v - x[i]);
-  const mx = x.reduce((s, v) => s + v, 0) / x.length;
-  let num = 0, den = 0;
-  for (let i = 0; i < x.length; i++) { num += (x[i] - mx) * y[i]; den += (x[i] - mx) ** 2; }
-  const beta = den ? num / den : 0;
-  return beta < 0 && beta > -1 ? -Math.log(2) / Math.log(1 + beta) : Infinity;
+/* ---------- order books: what it really costs to trade `qty` units now ---------- */
+async function getBook(m, maxAgeMs = 30000) {
+  const c = sc.books.get(m.key);
+  if (c && Date.now() - c.at < maxAgeMs) return c.book;
+  const v = VENUES.find(x => x.id === m.venue);
+  let book = null;
+  if (v?.book) book = await v.book(m);
+  else if (m.bid > 0 && m.ask > 0) book = { bids: [[m.bid, Infinity]], asks: [[m.ask, Infinity]], quoteOnly: true };   // Variational RFQ quote
+  sc.books.set(m.key, { at: Date.now(), book });
+  return book;
 }
+function walk(levels, qty) {            // average fill price for qty units, or null if the book is too thin
+  let left = qty, cost = 0;
+  for (const [px, sz] of levels) { const take = Math.min(left, sz); cost += take * px; left -= take; if (left <= 1e-12) break; }
+  return left > 1e-12 ? null : cost / qty;
+}
+/* market round trip on one leg, in bps of mid: buy then sell (or the reverse) qty units at today's book */
+function marketCostBps(book, qty) {
+  if (!book || !book.bids.length || !book.asks.length) return null;
+  const mid = (book.bids[0][0] + book.asks[0][0]) / 2;
+  const buy = walk(book.asks, qty), sell = walk(book.bids, qty);
+  if (buy == null || sell == null) return { thin: true, spreadBps: (book.asks[0][0] - book.bids[0][0]) / mid * 1e4, depthUsd: depthUsd(book, mid) };
+  return { bps: ((buy - mid) + (mid - sell)) / mid * 1e4, spreadBps: (book.asks[0][0] - book.bids[0][0]) / mid * 1e4, depthUsd: depthUsd(book, mid), quoteOnly: !!book.quoteOnly };
+}
+function depthUsd(book, mid) {         // $ resting within 0.25 % of mid on the thinner side
+  const side = lv => lv.filter(([p]) => Math.abs(p / mid - 1) <= 0.0025).reduce((s, [p, z]) => s + p * (isFinite(z) ? z : 0), 0);
+  return Math.min(side(book.bids), side(book.asks));
+}
+
+/* ---------- quality guard (history) ---------- */
 function spikesPerDay(p, other, days) {
-  // a bar where one venue jumps > 5x its usual move while the other barely moves, and it reverts within 3 bars
   const r = p.map((v, i) => i ? Math.log(v / p[i - 1]) : 0), ro = other.map((v, i) => i ? Math.log(v / other[i - 1]) : 0);
   let n = 0;
   for (let i = 49; i < r.length - 3; i++) {
     let s2 = 0; for (let k = i - 48; k < i; k++) s2 += r[k] * r[k];
     const sd = Math.sqrt(s2 / 48) || 1e-9;
-    if (Math.abs(r[i]) > 5 * sd && Math.abs(r[i]) > 0.002 && Math.abs(ro[i]) < 1.5 * sd) {
-      const back = r[i + 1] + r[i + 2] + r[i + 3];
-      if (-back / r[i] > 0.6) n++;
-    }
+    if (Math.abs(r[i]) > 5 * sd && Math.abs(r[i]) > 0.002 && Math.abs(ro[i]) < 1.5 * sd && -(r[i + 1] + r[i + 2] + r[i + 3]) / r[i] > 0.6) n++;
   }
   return n / Math.max(days, 1);
 }
-
-/* ---------- 5. backtester ---------- */
-function backtest(d, s, allowFn, feeA, feeB) {
-  const { t, pa, pb, act } = d;
-  const meas = i => s.unit === "bps" ? (pb[i] / pa[i] - 1) * 1e4 : pb[i] - pa[i];
-  const trades = [];
-  let pos = 0, i0 = -1, worst = 0, k = 1;
-  const holdMs = s.holdH * 3600e3;
-  while (k < t.length - 1) {
-    if (!pos) {
-      const g = meas(k), gp = meas(k - 1);
-      if (allowFn(t[k]) && act[k] && act[k - 1] && Math.abs(g) >= s.entry && Math.abs(gp) >= s.entry && g * gp > 0) {
-        pos = g > 0 ? 1 : -1; i0 = k + 1; worst = 0; k += 2; continue;      // filled on the next bar
-      }
-    } else {
-      const g = meas(k);
-      const q = s.sizeMode === "usd" ? s.size / pa[i0] : s.size;
-      worst = Math.min(worst, q * pos * ((pb[i0] - pa[i0]) - (pb[k] - pa[k])));
-      if ((act[k] && (Math.abs(g) <= s.exit || g * pos < 0)) || t[k] - t[i0] >= holdMs) {
-        const x = k + 1;
-        const ptsIn = pb[i0] - pa[i0], ptsOut = pb[x] - pa[x];
-        const gross = q * pos * (ptsIn - ptsOut);
-        const cost = q * (pa[i0] + pa[x]) * (feeA + feeB + 2 * s.slip / 1e4);   // 4 fills
-        trades.push({ tIn: t[i0], tOut: t[x], dir: pos, gapIn: meas(i0), gapOut: meas(x), ptsIn, ptsOut,
-          gross, cost, net: gross - cost, worst, hours: (t[x] - t[i0]) / 3600e3, sess: sessionOf(t[i0]), forced: t[k] - t[i0] >= holdMs });
-        pos = 0; k = x + 1; continue;
-      }
-    }
-    k++;
-  }
-  return trades;
+function qualityOf(p, d, s, sess) {
+  const flags = []; let score = 100;
+  if (p.a.cls === "crypto") { score -= 35; flags.push(["Crypto token: a big player can push one venue's price to drain market makers. Treat every gap as suspect.", "bad"]); }
+  if (p.a.cls === "preipo") { score -= 25; flags.push(["Pre-IPO: no outside price, so a gap may never close.", "bad"]); }
+  if (p.minVol < 1e6) { score -= 15; flags.push([`Thin: the quieter venue trades ${fmtUsd(p.minVol)} a day.`, "warn"]); }
+  const stale = 1 - d.act.filter(Boolean).length / d.act.length;
+  if (stale > 0.2) { score -= 15; flags.push([`Stale: ${(stale * 100).toFixed(0)}% of bars had no trade on one venue, so some gaps are just old prices.`, "warn"]); }
+  const spA = spikesPerDay(d.pa, d.pb, s.days), spB = spikesPerDay(d.pb, d.pa, s.days), sp = Math.max(spA, spB);
+  if (sp >= 0.5) { score -= Math.min(30, sp * 12); flags.push([`${(spA >= spB ? p.A : p.B).exchangeLabel} had ${sp.toFixed(1)} one-venue spikes a day that snapped back: possible manipulation or wicks on a thin book.`, sp >= 1.5 ? "bad" : "warn"]); }
+  return { flags, score: Math.max(0, Math.round(score)), stale };
 }
-const sumNet = tr => tr.reduce((s, x) => s + x.net, 0);
+
+/* ---------- 4. opportunity spotter ---------- */
+function findOpportunities(d, s, sess, gapOf) {
+  const eps = [], n = d.t.length, step = IV_MS[s.iv];
+  let i = 0;
+  while (i < n) {
+    const g = gapOf(i);
+    if (!(d.act[i] && Math.abs(g) >= s.entry)) { i++; continue; }
+    const side = Math.sign(g); let j = i, last = i, peak = Math.abs(g);
+    // the window lasts while the gap stays on the same side and near the entry level (short dips allowed)
+    while (j + 1 < n && Math.sign(gapOf(j + 1)) === side && Math.abs(gapOf(j + 1)) >= s.entry * 0.7) {
+      j++; if (Math.abs(gapOf(j)) >= s.entry) last = j; peak = Math.max(peak, Math.abs(gapOf(j)));
+    }
+    eps.push({ i0: i, i1: last, side, peak, start: d.t[i], end: d.t[last] + step, minutes: (d.t[last] + step - d.t[i]) / 60e3, sess: sess[i] });
+    i = j + 1;
+  }
+  return eps;
+}
+
+/* ---------- 7. trade simulator ---------- */
+function closeDeadline(tMs, s) {
+  if (s.closeBy === "day") { const d = new Date(tMs); d.setHours(23, 59, 0, 0); return d.getTime(); }
+  return tMs + +s.closeBy * 3600e3;
+}
+function simulate(op, d, s, gapOf, costs) {
+  const step = IV_MS[s.iv];
+  // you notice it and act `react` minutes after it first appears, if it is still at the entry level
+  let e = op.i0; while (e <= op.i1 && d.t[e] - op.start < s.react * 60e3) e++;
+  while (e <= op.i1 && !(d.act[e] && Math.abs(gapOf(e)) >= s.entry)) e++;
+  if (e > op.i1 || e >= d.t.length - 1) return { missed: true };
+  const side = op.side, deadline = closeDeadline(d.t[e], s);
+  let x = -1, reason = "", best = 0, flipped = false;
+  for (let k = e + 1; k < d.t.length; k++) {
+    const g = gapOf(k);
+    if (d.t[k] >= deadline) { x = k; reason = "deadline"; break; }
+    if (!d.act[k]) continue;
+    if (Math.sign(g) === -side && Math.abs(g) > s.exit) flipped = true;
+    if (s.flip === "ride" && flipped) {
+      best = Math.max(best, -side * g);                      // how far it has swung the other way
+      if (best - (-side * g) >= s.trail) { x = k; reason = "rode the flip"; break; }
+      continue;
+    }
+    if (Math.abs(g) <= s.exit || Math.sign(g) === -side) { x = k; reason = flipped ? "flipped" : "converged"; break; }
+  }
+  if (x < 0) return { open: true, e };
+  const q = s.sizeMode === "usd" ? s.size / d.pa[e] : s.size;
+  const ptsIn = d.pb[e] - d.pa[e], ptsOut = d.pb[x] - d.pa[x];
+  const gross = q * side * (ptsIn - ptsOut);
+  const notional = q * (d.pa[e] + d.pa[x]) / 2;
+  // market: taker fee on 4 fills + today's book impact on both legs; limit: maker fee on 4 fills
+  const mkt = costs.mktA == null || costs.mktB == null ? null : notional * (2 * (costs.takerA + costs.takerB) + (costs.mktA + costs.mktB) / 1e4);
+  const lim = notional * 2 * (costs.makerA + costs.makerB);
+  return { e, x, tIn: d.t[e], tOut: d.t[x], gIn: gapOf(e), gOut: gapOf(x), q, gross, netMkt: mkt == null ? null : gross - mkt, netLim: gross - lim, costMkt: mkt, costLim: lim,
+    hours: (d.t[x] - d.t[e]) / 3600e3, reason, sameDay: new Date(d.t[e]).toDateString() === new Date(d.t[x]).toDateString(), sess: sessionOf(d.t[e]) };
+}
 
 /* ---------- the run ---------- */
 async function runScan() {
   if (sc.running) return;
   const s = scSettings();
-  sc.running = true; sc.stop = false; sc.results = []; sc.open.clear(); sc.agents = {}; sc.log = [];
+  sc.running = true; sc.stop = false; sc.results = []; sc.opps = []; sc.open.clear(); sc.agents = {}; sc.log = [];
   document.getElementById("scRun").disabled = true; document.getElementById("scStop").hidden = false;
   renderScanResults();
+  const allow = { all: () => true, weekday: t => sessionOf(t) !== "weekend", us: t => sessionOf(t) === "us" }[s.session];
   try {
     const pairs = findPairs(s);
     const noHist = [...state.assets.values()].filter(a => a.keys.length >= 2).flatMap(a => a.keys.map(k => state.markets.get(k))).filter(m => m && !m.hist && isShown(m.exchange)).length;
-    agentSay("finder", `${pairs.length} pairs with candle history on both venues and ≥ ${fmtUsd(s.minVol)} daily volume on the thinner one.${noHist ? ` ${noHist} Variational markets left out: Variational publishes no price history (watch them live on the Dashboard).` : ""}`, "done");
-    if (!pairs.length) { agentSay("judge", "Nothing to test with these settings. Lower the volume floor or widen the asset types.", "done"); return; }
-    const allow = { all: () => true, weekday: t => sessionOf(t) !== "weekend", us: t => sessionOf(t) === "us" };
+    agentSay("finder", `${pairs.length} pairs to test (history on both venues, ≥ ${fmtUsd(s.minVol)} a day on the thinner one).${noHist ? ` ${noHist} Variational markets left out: Variational publishes no price history.` : ""}`, "done");
+    if (!pairs.length) { agentSay("analyst", "Nothing to test with these settings. Lower the volume floor or widen the asset types.", "done"); return; }
     let done = 0;
     const queue = [...pairs];
     const worker = async () => {
@@ -1317,75 +1373,57 @@ async function runScan() {
           const mapB = new Map(cb.map(r => [r[0], r]));
           const d = { t: [], pa: [], pb: [], act: [] };
           for (const r of ca) { const o = mapB.get(r[0]); if (!o) continue; d.t.push(r[0]); d.pa.push(r[1]); d.pb.push(o[1]); d.act.push(!!(r[4] && o[4])); }
-          if (d.t.length < 100) { sc.results.push({ p, label, skip: `only ${d.t.length} bars on both venues` }); continue; }
+          if (d.t.length < 50) { sc.results.push({ p, label, skip: `only ${d.t.length} bars on both venues` }); continue; }
+          const gapOf = s.unit === "bps" ? i => (d.pb[i] / d.pa[i] - 1) * 1e4 : i => d.pb[i] - d.pa[i];
 
-          agentSay("session", `Tagging ${d.t.length} bars of ${p.a.label} by market session`);
+          agentSay("session", `Tagging ${d.t.length} bars of ${p.a.label}`);
           const sess = d.t.map(sessionOf);
-          const share = k => sess.filter(x => x === k).length / sess.length;
 
-          agentSay("quality", `Checking ${label} for spikes, stale books and permanent premiums`);
-          const gapB = d.pa.map((v, i) => (d.pb[i] / v - 1) * 1e4);
-          const absG = gapB.map(Math.abs).sort((x, y) => x - y);
-          const med = absG[absG.length >> 1], p90 = absG[Math.floor(absG.length * .9)];
-          const meanGap = gapB.reduce((x, y) => x + y, 0) / gapB.length;
-          const hl = halfLifeHours(d.t, gapB);
-          const stale = 1 - d.act.filter(Boolean).length / d.act.length;
-          const spA = spikesPerDay(d.pa, d.pb, s.days), spB = spikesPerDay(d.pb, d.pa, s.days);
-          const wkG = gapB.filter((g, i) => sess[i] === "weekend").map(Math.abs), wdG = gapB.filter((g, i) => sess[i] !== "weekend").map(Math.abs);
-          const avg = a => a.length ? a.reduce((x, y) => x + y, 0) / a.length : null;
-          const flags = [];
-          let score = 100;
-          if (p.a.cls === "crypto") { score -= 35; flags.push(["Crypto token: one venue can be pushed around (big players have done this to drain market makers). Treat every gap as suspect.", "bad"]); }
-          if (p.a.cls === "preipo") { score -= 25; flags.push(["Pre-IPO: no outside price, so the gap may never close.", "bad"]); }
-          if (p.minVol < 1e6) { score -= 15; flags.push([`Thin: the quieter venue trades ${fmtUsd(p.minVol)} a day, so fills will move the price.`, "warn"]); }
-          if (stale > 0.2) { score -= 15; flags.push([`Stale: ${(stale * 100).toFixed(0)}% of bars had no trade on one venue, so some gaps are just old prices.`, "warn"]); }
-          const sp = Math.max(spA, spB);
-          if (sp >= 0.5) { score -= Math.min(30, sp * 12); flags.push([`${(spA >= spB ? p.A : p.B).exchangeLabel} had ${sp.toFixed(1)} one-venue spikes a day that snapped back: possible manipulation or thin-book wicks.`, sp >= 1.5 ? "bad" : "warn"]); }
-          const persistent = Math.abs(meanGap) >= s.entry * (s.unit === "bps" ? 1 : 1e4 / d.pa[0]) && (hl == null || hl > 48);
-          if (persistent) { score -= 15; flags.push([`Standing premium: ${p.B.exchangeLabel} sits ${fmtBps(meanGap)} bps from ${p.A.exchangeLabel} on average and rarely returns to zero, so entries at your level may never close.`, "warn"]); }
-          if (wkG.length && wdG.length && avg(wkG) > 2 * avg(wdG)) flags.push([`Weekend gaps are ${(avg(wkG) / avg(wdG)).toFixed(1)}× weekday gaps: the US market is shut then, so stock perps trade with no outside price${p.A.venue === "variational" || p.B.venue === "variational" ? " (and Variational's swaps stop quoting)" : ""}.`, "info"]);
-          score = Math.max(0, Math.round(score));
+          agentSay("spotter", `Looking for gaps ≥ ${s.entry} that lasted ${fmtDur(s.minWin * 60e3)} on ${label}`);
+          const eps = findOpportunities(d, s, sess, gapOf);
+          const real = eps.filter(o => o.minutes >= s.minWin && allow(o.start));
+          const brief = eps.filter(o => o.minutes < s.minWin).length;
 
-          agentSay("backtest", `Replaying your rule on ${label}`);
-          const fa = p.A.takerFee ?? 0.00045, fb = p.B.takerFee ?? 0.00045;
-          const tr = { all: backtest(d, s, allow.all, fa, fb), weekday: backtest(d, s, allow.weekday, fa, fb), us: backtest(d, s, allow.us, fa, fb) };
-          const main = tr[s.session];
-          const wins = main.filter(x => x.net > 0).length;
+          agentSay("quality", `Checking ${label}`);
+          const qual = qualityOf(p, d, s, sess);
 
-          agentSay("judge", `Grading ${label}`);
-          const net = sumNet(main), why = [];
-          let verdict;
-          if (main.length < 3) { verdict = "na"; why.push(`Only ${main.length} trade${main.length === 1 ? "" : "s"} at your entry level in ${s.days} days: not enough to judge.`); }
-          else {
-            // worth bothering with: at least 0.25 % of one leg's notional over the period ($25 per $10k)
-            const notional = s.sizeMode === "usd" ? s.size : s.size * d.pa[d.pa.length - 1];
-            const minNet = 0.0025 * notional, winRate = wins / main.length;
-            if (net >= minNet && winRate >= 0.6 && score >= 65 && !["crypto", "preipo"].includes(p.a.cls)) { verdict = "go"; why.push(`${main.length} trades, ${wins} winners, ${fmtUsd(net)} net after fees and slippage.`); }
-            else if (net > 0) {
-              const reason = net < minNet ? `that is under ${fmtUsd(minNet)} (0.25% of your size), too small to be worth the risk`
-                : score < 65 ? "the quality guard is worried (see flags)" : winRate < 0.6 ? `only ${Math.round(winRate * 100)}% of trades won, so a few big winners carried it` : "the asset type is risky";
-              verdict = "watch"; why.push(`Made ${fmtUsd2(net)} over ${main.length} trades, but ${reason}.`);
-            }
+          let costs = { takerA: p.A.takerFee ?? 0.00045, takerB: p.B.takerFee ?? 0.00045, makerA: p.A.makerFee ?? 0.00015, makerB: p.B.makerFee ?? 0.00015, mktA: null, mktB: null };
+          let bookNote = null;
+          if (real.length) {
+            agentSay("books", `Reading both order books for ${label}`);
+            const q = s.sizeMode === "usd" ? s.size / d.pa[d.pa.length - 1] : s.size;
+            const [ba, bb] = await Promise.all([getBook(p.A).catch(() => null), getBook(p.B).catch(() => null)]);
+            const ca2 = marketCostBps(ba, q), cb2 = marketCostBps(bb, q);
+            costs.mktA = ca2 && !ca2.thin ? ca2.bps : null; costs.mktB = cb2 && !cb2.thin ? cb2.bps : null;
+            bookNote = { A: ca2, B: cb2, q };
           }
-          if (verdict === undefined) { verdict = "avoid"; why.push(`Lost ${fmtUsd2(-net)} over ${main.length} trades: the gap rarely closed enough to pay for fees and slippage.`); }
-          const forced = main.filter(x => x.forced).length;
-          if (forced) why.push(`${forced} trade${forced > 1 ? "s" : ""} never reached your exit and were closed after ${s.holdH / 24} day${s.holdH > 24 ? "s" : ""}.`);
-          if (s.session !== "all") { const d2 = sumNet(tr.all) - net; if (Math.abs(d2) > 1) why.push(`Trading any time instead would have ${d2 > 0 ? "added" : "cost"} ${fmtUsd(Math.abs(d2))}${tr.all.filter(x => x.sess === "weekend").length ? `, mostly from ${tr.all.filter(x => x.sess === "weekend").length} weekend trades` : ""}.`); }
-          sc.results.push({ p, label, d, flags, score, verdict, why, tr, main, wins, net, med, p90, meanGap, hl, stale, wkShare: share("weekend"),
-            avgCap: main.length ? main.reduce((x, y) => x + (y.dir * (y.ptsIn - y.ptsOut)), 0) / main.length : null,
-            avgHold: main.length ? main.reduce((x, y) => x + y.hours, 0) / main.length : null, worst: main.reduce((x, y) => Math.min(x, y.worst), 0) });
+
+          agentSay("sim", `Simulating ${real.length} opportunit${real.length === 1 ? "y" : "ies"} on ${label}`);
+          const trades = [];
+          let missed = 0, stillOpen = 0;
+          for (const op of real) {
+            const r = simulate(op, d, s, gapOf, costs);
+            if (r.missed) { missed++; continue; }
+            if (r.open) { stillOpen++; sc.opps.push({ p, label, op, open: true }); continue; }
+            trades.push(r); sc.opps.push({ p, label, op, tr: r });
+          }
+          const conv = trades.filter(t => t.reason !== "deadline");
+          const res = { p, label, d, eps, real, brief, trades, conv, missed, stillOpen, qual, bookNote, costs,
+            lim: trades.reduce((x, t) => x + t.netLim, 0), mkt: trades.some(t => t.netMkt == null) ? null : trades.reduce((x, t) => x + t.netMkt, 0) };
+          judge(res, s);
+          sc.results.push(res);
         } catch (e) {
-          sc.results.push({ p, label, skip: "could not load history: " + (e.message || e) });
+          sc.results.push({ p, label, skip: "could not load: " + (e.message || e) });
         } finally {
           done++;
           if (done % 3 === 0 || !queue.length) renderScanResults();
         }
       }
     };
-    await Promise.all([worker(), worker()]);           // two at a time, gentle on the APIs
-    const go = sc.results.filter(r => r.verdict === "go").length, w = sc.results.filter(r => r.verdict === "watch").length;
-    for (const a of ["history", "session", "quality", "backtest"]) sc.agents[a] = { msg: `Finished ${done} pairs`, st: "done" };
-    agentSay("judge", sc.stop ? `Stopped after ${done} pairs.` : `Done: ${go} tradeable, ${w} to watch, out of ${done} pairs.`, "done");
+    await Promise.all([worker(), worker()]);
+    for (const a of ["history", "session", "spotter", "quality", "books", "sim"]) sc.agents[a] = { msg: `Finished ${done} pairs`, st: "done" };
+    const n = sc.opps.filter(o => o.tr).length;
+    agentSay("analyst", sc.stop ? `Stopped after ${done} pairs.` : `Done: ${n} opportunities you could have taken across ${done} pairs. Summary below.`, "done");
   } finally {
     sc.running = false;
     document.getElementById("scRun").disabled = false; document.getElementById("scStop").hidden = true;
@@ -1393,74 +1431,148 @@ async function runScan() {
   }
 }
 document.getElementById("scRun").addEventListener("click", runScan);
-document.getElementById("scStop").addEventListener("click", () => { sc.stop = true; agentSay("judge", "Stopping after the pairs in progress…"); });
+document.getElementById("scStop").addEventListener("click", () => { sc.stop = true; agentSay("analyst", "Stopping after the pairs in progress…"); });
+
+/* ---------- analyst: verdict per pair ---------- */
+function judge(r, s) {
+  const why = [], t = r.trades, wins = t.filter(x => x.netLim > 0).length;
+  const notional = s.sizeMode === "usd" ? s.size : s.size * r.d.pa[r.d.pa.length - 1];
+  const minNet = 0.0025 * notional;
+  if (!r.real.length) {
+    r.verdict = "na";
+    why.push(r.eps.length ? `The gap reached ${s.entry} ${s.unit} ${r.eps.length} time${r.eps.length > 1 ? "s" : ""}, but never stayed ${fmtDur(s.minWin * 60e3)}${r.brief ? " (too brief to act on)" : ""}.` : `The gap never reached ${s.entry} ${s.unit} in ${s.days} days.`);
+  } else {
+    const conv = r.conv.length;
+    why.push(`${r.real.length} window${r.real.length > 1 ? "s" : ""} lasted over ${fmtDur(s.minWin * 60e3)}. ${t.length} could be taken after your ${s.react}-minute reaction${r.missed ? `, ${r.missed} closed before you could act` : ""}${r.stillOpen ? `, ${r.stillOpen} still open now` : ""}.`);
+    if (t.length) why.push(`${conv} of ${t.length} converged before your deadline${t.length - conv ? `; ${t.length - conv} had to be closed unconverged` : ""}. Median time to close: ${fmtDur(median(t.map(x => x.hours)) * 3600e3)}.`);
+    if (t.length) why.push(`With limit orders: ${fmtUsd2(r.lim)} (${wins} of ${t.length} won). With market orders: ${r.mkt == null ? "the book is too thin to fill your size" : fmtUsd2(r.mkt)}${r.mkt != null && r.lim > 0 ? `, so taker fees and crossing the book eat ${Math.round(Math.min(999, (r.lim - r.mkt) / r.lim * 100))}% of the profit` : ""}.`);
+    const good = t.length >= 3 && r.lim >= minNet && wins / Math.max(1, t.length) >= 0.6 && r.qual.score >= 65 && !["crypto", "preipo"].includes(r.p.a.cls);
+    r.verdict = !t.length ? "na" : good && (r.mkt == null || r.mkt > 0) ? "go" : good ? "limit" : r.lim > 0 ? "watch" : "avoid";
+    if (r.verdict === "limit") why.push("Only worth it with limit orders: market orders lose the edge.");
+    if (r.verdict === "watch") why.push(t.length < 3 ? "Fewer than 3 trades: too few to trust." : r.lim < minNet ? `Under ${fmtUsd(minNet)} (0.25% of your size) over ${s.days} days: too small for the risk.` : r.qual.score < 65 ? "The quality guard is worried (see flags)." : wins / t.length < 0.6 ? "Fewer than 60% of trades won." : "The asset type is risky.");
+  }
+  if (r.bookNote) {
+    const b = (m, c) => !c ? `${m.exchangeLabel}: no book` : c.thin ? `${m.exchangeLabel}: too thin for ${fmtNum(r.bookNote.q)} units (only ${fmtUsd(c.depthUsd)} within 0.25%)` : `${m.exchangeLabel}: spread ${c.spreadBps.toFixed(1)} bps, market round trip ${c.bps.toFixed(1)} bps, ${fmtUsd(c.depthUsd)} within 0.25%`;
+    why.push(`Order books now. ${b(r.p.A, r.bookNote.A)}. ${b(r.p.B, r.bookNote.B)}.`);
+  }
+  r.why = why;
+}
+const fmtNum = v => v >= 100 ? v.toFixed(0) : v >= 1 ? v.toFixed(2) : v.toPrecision(3);
+
+/* ---------- analyst: daily summary ---------- */
+function dailySummary(s) {
+  const taken = sc.opps.filter(o => o.tr);
+  if (!sc.results.length) return "";
+  const dayKey = t => { const d = new Date(t); return d.getFullYear() + "-" + (d.getMonth() + 1) + "-" + d.getDate(); };
+  const days = [];
+  for (let k = 0; k < 3; k++) { const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - k); days.push(d); }
+  const unit = s.unit === "bps" ? "bps" : "points";
+  const lines = days.map((d, k) => {
+    const key = dayKey(d.getTime());
+    const list = taken.filter(o => dayKey(o.tr.tIn) === key).sort((a, b) => b.tr.netLim - a.tr.netLim);
+    const openNow = sc.opps.filter(o => o.open && dayKey(o.op.start) === key);
+    const name = k === 0 ? "Today" : k === 1 ? "Yesterday" : d.toLocaleDateString(undefined, { weekday: "long" });
+    const date = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+    const wk = sessionOf(d.getTime()) === "weekend" || [0, 6].includes(d.getDay());
+    if (!list.length) return `<p><b>${name} (${date}).</b> No gap of ${s.entry} ${unit} lasted ${fmtDur(s.minWin * 60e3)} on the pairs scanned${openNow.length ? `; ${openNow.length} window${openNow.length > 1 ? "s are" : " is"} open right now (${openNow.map(o => esc(o.p.a.label)).join(", ")})` : ""}.${wk ? " Stock, index, FX and commodity markets are shut at the weekend, so their perps drift without an outside price; gaps then are less reliable." : ""}</p>`;
+    const sum = list.reduce((x, o) => x + o.tr.netLim, 0), sumM = list.every(o => o.tr.netMkt != null) ? list.reduce((x, o) => x + o.tr.netMkt, 0) : null;
+    const conv = list.filter(o => o.tr.reason !== "deadline").length;
+    const b = list[0], t = b.tr;
+    const rich = t.gIn > 0 ? b.p.B.exchangeLabel : b.p.A.exchangeLabel, cheap = t.gIn > 0 ? b.p.A.exchangeLabel : b.p.B.exchangeLabel;
+    const others = list.slice(1, 3).map(o => `${esc(o.p.a.label)} (${fmtUsd2(o.tr.netLim)})`).join(", ");
+    return `<p><b>${name} (${date}).</b> ${list.length} opportunit${list.length > 1 ? "ies" : "y"} you could have acted on, ${conv} closed at your exit level the same day. ` +
+      `Best: <b>${esc(b.p.a.label)}</b>, ${esc(rich)} above ${esc(cheap)} by ${Math.abs(t.gIn).toFixed(1)} ${unit} at ${fmtClock(t.tIn).slice(0, 5)} (peak ${b.op.peak.toFixed(1)}), ` +
+      `${t.reason === "deadline" ? `still ${Math.abs(t.gOut).toFixed(1)} apart at your deadline` : t.reason === "rode the flip" ? `flipped and you rode it to ${(-Math.sign(t.gIn) * t.gOut).toFixed(1)} the other way` : t.reason === "flipped" ? `flipped to ${Math.abs(t.gOut).toFixed(1)} the other way after ${fmtDur(t.hours * 3600e3)} (you gain the full swing)` : `back to ${Math.abs(t.gOut).toFixed(1)} after ${fmtDur(t.hours * 3600e3)}`}: ` +
+      `${fmtUsd2(t.netLim)} with limit orders${t.netMkt != null ? `, ${fmtUsd2(t.netMkt)} with market orders` : ""}.` +
+      `${others ? ` Also ${others}.` : ""} All together ${fmtUsd2(sum)} with limits${sumM != null ? ` or ${fmtUsd2(sumM)} with market orders` : ""}.${wk ? " Weekend: the underlying markets were shut, so these perps had no outside price. Treat them with care." : ""}</p>`;
+  });
+  const all = taken.reduce((x, o) => x + o.tr.netLim, 0);
+  const pairsGo = sc.results.filter(r => r.verdict === "go" || r.verdict === "limit");
+  const lead = `<p class="muted">${taken.length} opportunities over the last ${s.days} days across ${sc.results.filter(r => !r.skip).length} pairs, worth ${fmtUsd2(all)} with limit orders at ${s.sizeMode === "usd" ? fmtUsd(s.size) : s.size + " units"} per leg. ${pairsGo.length ? `Pairs that passed every check: ${pairsGo.sort((a, b) => b.lim - a.lim).slice(0, 6).map(r => esc(r.p.a.label) + " (" + esc(r.p.A.exchangeLabel) + " / " + esc(r.p.B.exchangeLabel) + (r.verdict === "limit" ? ", limit orders only" : "") + ")").join(", ")}.` : "No pair passed every check."} Prices are last trades on 5-minute bars, so check the live books before you act.</p>`;
+  return lead + lines.join("");
+}
 
 /* ---------- results ---------- */
-const VERDICT = { go: "Tradeable", watch: "Watch", avoid: "Avoid", na: "Too few trades" };
+const VERDICT = { go: "Tradeable", limit: "Limit orders only", watch: "Watch", avoid: "Avoid", na: "No real window" };
 function renderScanResults() {
   const s = scSettings();
   const rs = sc.results.filter(r => !r.skip);
-  const go = rs.filter(r => r.verdict === "go");
-  const best = [...rs].sort((a, b) => b.net - a.net)[0];
+  document.getElementById("scDaily").innerHTML = rs.length ? dailySummary(s) : `<p class="muted">${sc.running ? "The analyst writes this when the agents finish." : "Run a scan to get a written summary of the last three days."}</p>`;
+  const taken = sc.opps.filter(o => o.tr);
   const k = (key, val, sub, c = "") => `<div class="kpi"><span class="k">${key}</span><span class="v ${c}">${val}</span><span class="s">${sub}</span></div>`;
+  const lim = taken.reduce((x, o) => x + o.tr.netLim, 0), mk = taken.every(o => o.tr.netMkt != null) ? taken.reduce((x, o) => x + o.tr.netMkt, 0) : null;
   document.getElementById("scSummary").innerHTML = rs.length ?
-    k("Pairs graded", rs.length, `${sc.results.length - rs.length} skipped (too little history)`) +
-    k("Tradeable", go.length, "made money, passed the quality guard", go.length ? "above" : "") +
-    k("Best pair", best ? fmtUsd(best.net) : "–", best ? esc(best.label) : "", best && best.net > 0 ? "above" : "") +
-    k("Tradeable pairs together", fmtUsd(go.reduce((x, r) => x + r.net, 0)), `${s.days} days, ${s.sizeMode === "usd" ? fmtUsd(s.size) : s.size + " units"} per leg`) : "";
-  const getters = { pair: r => r.label, cls: r => r.p.a.cls, score: r => r.score, trades: r => r.main.length, win: r => r.main.length ? r.wins / r.main.length : null,
-    net: r => r.net, all: r => sumNet(r.tr.all), cap: r => r.avgCap, hold: r => r.avgHold, worst: r => r.worst, med: r => r.med, verdict: r => ({ go: 3, watch: 2, na: 1, avoid: 0 }[r.verdict]) };
+    k("Pairs scanned", rs.length, `${sc.results.length - rs.length} skipped`) +
+    k("Windows ≥ " + fmtDur(s.minWin * 60e3), rs.reduce((x, r) => x + r.real.length, 0), `${rs.reduce((x, r) => x + r.brief, 0)} more were too brief`) +
+    k("Opportunities taken", taken.length, `${taken.filter(o => o.tr.reason !== "deadline").length} converged in time`) +
+    k("With limit orders", fmtUsd2(lim), "maker fees only, if your limits fill", lim > 0 ? "above" : "") +
+    k("With market orders", mk == null ? "–" : fmtUsd2(mk), "taker fees + today's book impact", mk > 0 ? "above" : mk < 0 ? "below" : "") : "";
+
+  // per-pair table
+  const getters = { pair: r => r.label, cls: r => r.p.a.cls, score: r => r.qual.score, win: r => r.real.length, taken: r => r.trades.length,
+    conv: r => r.trades.length ? r.conv.length / r.trades.length : null, limit: r => r.lim, market: r => r.mkt, verdict: r => ({ go: 4, limit: 3, watch: 2, na: 1, avoid: 0 }[r.verdict]) };
   const rows = applySort([...rs], "sc", getters);
-  const unitLbl = s.unit === "bps" ? "bps" : "pts";
   const head = `<thead><tr>${sortHeader("sc", "pair", "Pair")}${sortHeader("sc", "cls", "Type")}${sortHeader("sc", "verdict", "Verdict")}${sortHeader("sc", "score", "Quality")}
-    ${sortHeader("sc", "med", "Typical gap bps", "Median absolute gap over the history")}${sortHeader("sc", "trades", "Trades")}${sortHeader("sc", "win", "Win %")}
-    ${sortHeader("sc", "cap", "Avg capture / unit", "Average price points captured per unit of the asset, before costs")}${sortHeader("sc", "net", "Net $", "Your session setting, after fees and slippage")}
-    ${sortHeader("sc", "all", "Net $, any time", "Same rule with weekend and overnight trades allowed")}${sortHeader("sc", "hold", "Avg hold")}${sortHeader("sc", "worst", "Worst drawdown $")}</tr></thead>`;
+    ${sortHeader("sc", "win", "Windows", "Gaps at your entry level that lasted at least your minimum time")}${sortHeader("sc", "taken", "Taken", "Windows still open after your reaction time")}
+    ${sortHeader("sc", "conv", "Converged", "Share that reached your exit level before the deadline")}
+    ${sortHeader("sc", "limit", "Net, limit $")}${sortHeader("sc", "market", "Net, market $")}<th class="l">Books now</th></tr></thead>`;
+  const bk = r => !r.bookNote ? `<span class="muted">not needed</span>` : [r.bookNote.A, r.bookNote.B].map(c => !c ? "no book" : c.thin ? `<span class="above">too thin</span>` : `${c.bps.toFixed(1)} bps`).join(" / ");
   const body = rows.map(r => {
-    const id = r.p.A.key + "~" + r.p.B.key;
-    const open = sc.open.has(id);
-    const flagTxt = r.flags.filter(f => f[1] !== "info").length;
+    const id = r.p.A.key + "~" + r.p.B.key, open = sc.open.has(id);
+    const nf = r.qual.flags.filter(f => f[1] !== "info").length;
     let html = `<tr class="sc-row" data-sc="${esc(id)}" aria-expanded="${open}">
       <td><div class="asset-cell"><b>${esc(r.p.a.label)}</b><span class="muted">${esc(r.p.A.exchangeLabel)} vs ${esc(r.p.B.exchangeLabel)}</span></div></td>
-      <td class="l">${classTag(r.p.a.cls)}</td>
-      <td class="l"><span class="pill ${r.verdict}">${VERDICT[r.verdict]}</span></td>
-      <td class="num ${r.score >= 65 ? "" : "above"}">${r.score}${flagTxt ? ` <span class="tag stale">${flagTxt} flag${flagTxt > 1 ? "s" : ""}</span>` : ""}</td>
-      <td class="num">${r.med.toFixed(1)}</td><td class="num">${r.main.length}</td>
-      <td class="num">${r.main.length ? Math.round(r.wins / r.main.length * 100) + "%" : "–"}</td>
-      <td class="num">${r.avgCap == null ? "–" : fmtPx(r.avgCap)}</td>
-      <td class="num ${r.net > 0 ? "above" : r.net < 0 ? "below" : ""}">${fmtUsd2(r.net)}</td>
-      <td class="num muted">${fmtUsd2(sumNet(r.tr.all))}</td>
-      <td class="num">${r.avgHold == null ? "–" : fmtDur(r.avgHold * 3600e3)}</td>
-      <td class="num">${fmtUsd2(r.worst)}</td></tr>`;
+      <td class="l">${classTag(r.p.a.cls)}</td><td class="l"><span class="pill ${r.verdict === "limit" ? "watch" : r.verdict}">${VERDICT[r.verdict]}</span></td>
+      <td class="num ${r.qual.score >= 65 ? "" : "above"}">${r.qual.score}${nf ? ` <span class="tag stale">${nf} flag${nf > 1 ? "s" : ""}</span>` : ""}</td>
+      <td class="num">${r.real.length}</td><td class="num">${r.trades.length}</td>
+      <td class="num">${r.trades.length ? Math.round(r.conv.length / r.trades.length * 100) + "%" : "–"}</td>
+      <td class="num ${r.lim > 0 ? "above" : r.lim < 0 ? "below" : ""}">${r.trades.length ? fmtUsd2(r.lim) : "–"}</td>
+      <td class="num ${r.mkt > 0 ? "above" : r.mkt < 0 ? "below" : ""}">${r.trades.length ? (r.mkt == null ? "book too thin" : fmtUsd2(r.mkt)) : "–"}</td>
+      <td class="l num">${bk(r)}</td></tr>`;
     if (open) {
-      const trs = r.main.slice(-40).reverse();
-      html += `<tr class="sc-detail"><td colspan="12"><div style="display:grid;gap:4px;max-width:1000px">
-        <b>Judge</b><ul>${r.why.map(w => `<li>${esc(w)}</li>`).join("")}</ul>
-        <b>Quality guard (score ${r.score} of 100)</b><ul>${r.flags.length ? r.flags.map(f => `<li class="${f[1] === "bad" ? "above" : ""}">${esc(f[0])}</li>`).join("") : "<li>No warning signs: both books traded steadily and the gap kept returning to normal.</li>"}</ul>
-        <span class="muted">Gap ${fmtBps(r.meanGap)} bps on average · 90% of the time within ${r.p90.toFixed(1)} bps · ${r.hl == null ? "half-life n/a" : r.hl === Infinity ? "gap does not revert" : "half-life " + fmtDur(r.hl * 3600e3)} · ${(r.wkShare * 100).toFixed(0)}% of bars on weekends · fees ${((r.p.A.takerFee ?? 0) * 1e4).toFixed(1)} + ${((r.p.B.takerFee ?? 0) * 1e4).toFixed(1)} bps per fill</span>
+      html += `<tr class="sc-detail"><td colspan="10"><div style="display:grid;gap:4px;max-width:1000px">
+        <b>Analyst</b><ul>${r.why.map(w => `<li>${esc(w)}</li>`).join("")}</ul>
+        <b>Quality guard (score ${r.qual.score} of 100)</b><ul>${r.qual.flags.length ? r.qual.flags.map(f => `<li class="${f[1] === "bad" ? "above" : ""}">${esc(f[0])}</li>`).join("") : "<li>No warning signs: both books traded steadily.</li>"}</ul>
+        <span class="muted">Fees per fill: ${esc(r.p.A.exchangeLabel)} taker ${(r.costs.takerA * 1e4).toFixed(2)} / maker ${(r.costs.makerA * 1e4).toFixed(2)} bps · ${esc(r.p.B.exchangeLabel)} taker ${(r.costs.takerB * 1e4).toFixed(2)} / maker ${(r.costs.makerB * 1e4).toFixed(2)} bps</span>
         <div><button class="linkish" data-dv="${esc(id)}">Open this pair in Divergence →</button></div>
-        ${trs.length ? `<div class="table-wrap"><table><thead><tr><th>Opened</th><th>Closed</th><th class="l">Side</th><th title="Gap when the entry filled, one bar after the signal">Gap at entry fill (${unitLbl})</th><th title="Gap when the exit filled">Gap at exit fill (${unitLbl})</th><th>Held</th><th>Gross $</th><th>Costs $</th><th>Net $</th><th class="l">Session</th></tr></thead><tbody>
-          ${trs.map(x => `<tr><td class="num">${fmtTime(x.tIn)}</td><td class="num">${fmtTime(x.tOut)}${x.forced ? " (gave up)" : ""}</td>
-            <td class="l">sell ${esc(x.dir > 0 ? r.p.B.exchangeLabel : r.p.A.exchangeLabel)} / buy ${esc(x.dir > 0 ? r.p.A.exchangeLabel : r.p.B.exchangeLabel)}</td>
-            <td class="num">${x.gapIn.toFixed(s.unit === "bps" ? 1 : 2)}</td><td class="num">${x.gapOut.toFixed(s.unit === "bps" ? 1 : 2)}</td>
-            <td class="num">${fmtDur(x.hours * 3600e3)}</td><td class="num">${fmtUsd2(x.gross)}</td><td class="num">${fmtUsd2(x.cost)}</td>
-            <td class="num ${x.net > 0 ? "above" : "below"}">${fmtUsd2(x.net)}</td><td class="l">${{ us: "US hours", off: "overnight", weekend: "weekend" }[x.sess]}</td></tr>`).join("")}
-          </tbody></table></div>` : ""}
+        ${oppTable(sc.opps.filter(o => o.p === r.p), s, false)}
       </div></td></tr>`;
     }
     return html;
   }).join("");
   const skipped = sc.results.filter(r => r.skip);
   document.getElementById("scTable").innerHTML = rs.length || skipped.length
-    ? head + `<tbody>${body}${skipped.length ? `<tr><td class="empty" colspan="12">Skipped: ${skipped.slice(0, 12).map(r => esc(r.label) + " (" + esc(r.skip) + ")").join("; ")}${skipped.length > 12 ? ` and ${skipped.length - 12} more` : ""}</td></tr>` : ""}</tbody>`
+    ? head + `<tbody>${body}${skipped.length ? `<tr><td class="empty" colspan="10">Skipped: ${skipped.slice(0, 10).map(r => esc(r.label) + " (" + esc(r.skip) + ")").join("; ")}${skipped.length > 10 ? ` and ${skipped.length - 10} more` : ""}</td></tr>` : ""}</tbody>`
     : `<tbody><tr><td class="empty">${sc.running ? "Agents are working…" : "No scan yet. Set your rule above and press Run scan."}</td></tr></tbody>`;
+  document.getElementById("scOpps").innerHTML = oppTable(sc.opps, s, true);
+}
+function oppTable(list, s, withPair) {
+  const unit = s.unit === "bps" ? "bps" : "pts";
+  const rows = applySort([...list], "opp2", { start: o => o.op.start, pair: o => o.label, peak: o => o.op.peak, lasted: o => o.op.minutes,
+    limit: o => o.tr ? o.tr.netLim : null, market: o => o.tr ? o.tr.netMkt : null, hold: o => o.tr ? o.tr.hours : null }).slice(0, withPair ? 300 : 60);
+  if (!rows.length) return withPair ? `<table><tbody><tr><td class="empty">${sc.running ? "Agents are working…" : "No opportunities yet."}</td></tr></tbody></table>` : "";
+  const sh = (c, l, t) => sortHeader("opp2", c, l, t);
+  return `<div class="table-wrap"><table><thead><tr>${sh("start", "Gap opened")}${withPair ? sh("pair", "Pair") : ""}<th class="l">Rich venue</th>${sh("peak", "Peak " + unit)}${sh("lasted", "Lasted")}
+    <th>In / out ${unit}</th>${sh("hold", "Held")}<th class="l">Outcome</th>${sh("limit", "Limit $")}${sh("market", "Market $")}<th class="l">Session</th></tr></thead><tbody>` +
+    rows.map(o => {
+      const t = o.tr, rich = o.op.side > 0 ? o.p.B.exchangeLabel : o.p.A.exchangeLabel;
+      return `<tr><td class="num">${fmtTime(o.op.start)}</td>${withPair ? `<td><div class="asset-cell"><b>${esc(o.p.a.label)}</b><span class="muted">${esc(o.p.A.exchangeLabel)} / ${esc(o.p.B.exchangeLabel)}</span></div></td>` : ""}
+        <td class="l">${esc(rich)}</td><td class="num">${o.op.peak.toFixed(1)}</td><td class="num">${fmtDur(o.op.minutes * 60e3)}</td>
+        <td class="num">${t ? `${Math.abs(t.gIn).toFixed(1)} → ${(t.gOut * Math.sign(t.gIn)).toFixed(1)}` : "–"}</td>
+        <td class="num">${t ? fmtDur(t.hours * 3600e3) : "–"}</td>
+        <td class="l">${o.open ? "<b>still open</b>" : { converged: "closed at exit", flipped: "flipped, closed", "rode the flip": "rode the flip", deadline: "<span class=\"above\">deadline, not converged</span>" }[t.reason]}${t && !t.sameDay ? " · next day" : ""}</td>
+        <td class="num ${t && t.netLim > 0 ? "above" : t && t.netLim < 0 ? "below" : ""}">${t ? fmtUsd2(t.netLim) : "–"}</td>
+        <td class="num ${t && t.netMkt > 0 ? "above" : t && t.netMkt < 0 ? "below" : ""}">${t ? (t.netMkt == null ? "too thin" : fmtUsd2(t.netMkt)) : "–"}</td>
+        <td class="l">${{ us: "US hours", off: "overnight", weekend: "weekend" }[o.op.sess]}</td></tr>`;
+    }).join("") + "</tbody></table></div>";
 }
 const fmtUsd2 = v => v == null || !isFinite(v) ? "–" : (v < 0 ? "−$" : "$") + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: Math.abs(v) < 100 ? 2 : 0, maximumFractionDigits: Math.abs(v) < 100 ? 2 : 0 });
-document.getElementById("scTable").addEventListener("click", e => {
+document.getElementById("view-scanner").addEventListener("click", e => {
   const dvb = e.target.closest("[data-dv]");
   if (dvb) {
     const r = sc.results.find(x => x.p && x.p.A.key + "~" + x.p.B.key === dvb.dataset.dv);
-    if (r) { dv.asset = r.p.a.key; dv.a = r.p.A.exchange; dv.b = r.p.B.exchange; document.getElementById("dvIv").value = document.getElementById("scIv").value; location.hash = "divergence";
+    if (r) { dv.asset = r.p.a.key; dv.a = r.p.A.exchange; dv.b = r.p.B.exchange; document.getElementById("dvIv").value = document.getElementById("scIv").value;
+      document.getElementById("dvThr").value = scSettings().unit === "bps" ? (scSettings().entry / 100).toFixed(2) : document.getElementById("dvThr").value; location.hash = "divergence";
       setTimeout(() => { document.getElementById("dvAsset").dataset.sig = ""; renderDvSelectors(); document.getElementById("dvAsset").value = r.p.a.key; fillDvVenues(); loadDivergence(); }, 0); }
     return;
   }
@@ -1470,6 +1582,53 @@ document.getElementById("scTable").addEventListener("click", e => {
   if (sc.open.has(id)) sc.open.delete(id); else sc.open.add(id);
   renderScanResults();
 });
+
+/* ---------- live check: gaps open right now, priced off the books for your size ---------- */
+async function liveCheck(force) {
+  if (sc.liveBusy || (!force && Date.now() - sc.liveAt < 30000)) return;
+  sc.liveBusy = true;
+  const s = scSettings();
+  try {
+    const cands = [...state.views.values()].filter(v => (TYPE_SETS[s.types] ? TYPE_SETS[s.types].includes(v.a.cls) : true) && v.ms.length >= 2 && v.minVol >= s.minVol && v.hi && v.lo
+      && (s.unit === "bps" ? v.maxGap : v.hi.price - v.lo.price) >= s.entry).sort((a, b) => b.maxGap - a.maxGap).slice(0, 8);
+    const out = [];
+    for (const v of cands) {
+      const q = s.sizeMode === "usd" ? s.size / v.lo.price : s.size;
+      const [bh, bl] = await Promise.all([getBook(v.hi, 15000).catch(() => null), getBook(v.lo, 15000).catch(() => null)]);
+      const ch = marketCostBps(bh, q), cl = marketCostBps(bl, q);
+      // what you would actually get now with market orders: sell q on the rich book, buy q on the cheap book
+      const sellRich = bh ? walk(bh.bids, q) : null, buyCheap = bl ? walk(bl.asks, q) : null;
+      const execBps = sellRich && buyCheap ? (sellRich / buyCheap - 1) * 1e4 : null;
+      const fees = 2 * ((v.hi.takerFee ?? 0.00045) + (v.lo.takerFee ?? 0.00045)) * 1e4;            // 4 taker fills, bps
+      const lfee = 2 * ((v.hi.makerFee ?? 0.00015) + (v.lo.makerFee ?? 0.00015)) * 1e4;
+      const notional = q * v.lo.price;
+      // closing later costs about the other half of each book's round trip
+      const exitHalf = ch && cl && !ch.thin && !cl.thin ? (ch.bps + cl.bps) / 2 : null;
+      out.push({ v, q, ch, cl, execBps, fees, lfee, notional,
+        mktEdge: execBps != null && exitHalf != null ? execBps - s.exit - exitHalf - fees : null,
+        limEdge: v.maxGap - s.exit - lfee });
+    }
+    sc.live = out; sc.liveAt = Date.now();
+  } finally { sc.liveBusy = false; renderLive(); }
+}
+function renderLive() {
+  const s = scSettings();
+  const el = document.getElementById("scLive");
+  if (!sc.liveAt) { el.innerHTML = `<tbody><tr><td class="empty">Checking the books…</td></tr></tbody>`; return; }
+  document.getElementById("scLiveAt").textContent = "Checked " + fmtClock(sc.liveAt) + ". Refreshes every 30 s while this page is open.";
+  if (!sc.live.length) { el.innerHTML = `<tbody><tr><td class="empty">No gap of ${s.entry} ${s.unit} open right now on the selected asset types.</td></tr></tbody>`; return; }
+  const bk = c => !c ? "no book" : c.thin ? `<span class="above">too thin (${fmtUsd(c.depthUsd)} near mid)</span>` : `${c.spreadBps.toFixed(1)} spread · ${c.bps.toFixed(1)} round trip${c.quoteOnly ? " (quote)" : ""}`;
+  el.innerHTML = `<thead><tr><th>Asset</th><th class="l">Sell (rich)</th><th class="l">Buy (cheap)</th><th>Gap now bps</th><th>Fill now bps</th><th class="l">Rich book</th><th class="l">Cheap book</th><th>Edge, market</th><th>Edge, limit</th></tr></thead><tbody>` +
+    sc.live.map(x => {
+      const usd = b => b == null ? "–" : `${b > 0 ? "+" : ""}${b.toFixed(1)} bps <span class="muted">(${fmtUsd2(b / 1e4 * x.notional)})</span>`;
+      return `<tr><td><div class="asset-cell"><b>${esc(x.v.a.label)}</b>${classTag(x.v.a.cls)}${jumpTag(x.v)}</div></td>
+      <td class="l">${esc(x.v.hi.exchangeLabel)}${ageTag(x.v.hi)}</td><td class="l">${esc(x.v.lo.exchangeLabel)}${ageTag(x.v.lo)}</td>
+      <td class="num above">${fmtBps(x.v.maxGap)}</td><td class="num">${x.execBps == null ? "–" : fmtBps(x.execBps)}</td>
+      <td class="l num">${bk(x.ch)}</td><td class="l num">${bk(x.cl)}</td>
+      <td class="num ${x.mktEdge > 0 ? "above" : "below"}">${usd(x.mktEdge)}</td><td class="num ${x.limEdge > 0 ? "above" : "below"}">${usd(x.limEdge)}</td></tr>`;
+    }).join("") + "</tbody>";
+}
+document.getElementById("scLiveBtn").addEventListener("click", () => liveCheck(true));
 
 /* =============================================================================================
    ROUTING, THEME, START

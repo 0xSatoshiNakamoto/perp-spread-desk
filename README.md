@@ -8,11 +8,18 @@ Live site: https://0xsatoshinakamoto.github.io/perp-spread-desk/
 
 ## Arb scanner
 
-Six rule-based agents run in the browser and grade every same-asset pair:
-pair finder → history (candles from Hyperliquid and Lighter) → session tagger (US hours, overnight, weekend)
-→ quality guard (one-venue spikes, stale books, standing premiums, crypto / pre-IPO risk, thin volume)
-→ backtester (your entry/exit gap rule, fills one bar late, fees + slippage) → judge (Tradeable / Watch / Avoid).
-Results come from last-trade candle prices; confirm the live bid/ask gap before trading. Funding is not included.
+Eight rule-based agents run in the browser and follow a gap-trading rule:
+1. **Enter** when the gap between two venues reaches the entry level (default 10 bps).
+2. Count it only if the gap **lasts** long enough to act on (default 1 hour), acting after a reaction delay (15 min).
+3. **Close** when the gap shrinks to the exit level (3 bps) or flips, by the deadline (same day by default);
+   optionally ride a flip with a trailing give-back.
+4. **Costs** come from the live order books: market orders pay taker fees and walk the book for your size,
+   limit orders pay maker fees (and may not fill on a thin book).
+
+Agents: pair finder → history → session tagger → opportunity spotter → quality guard (one-venue spikes,
+stale books, crypto / pre-IPO risk) → order-book checker → trade simulator → analyst (verdicts and a
+daily summary of the last three days). A live panel prices gaps open right now off both books.
+Results use last-trade candle prices; check the live books before trading. Funding is not included.
 
 - Hyperliquid and Lighter stream over WebSocket (about one update per second); Variational is polled every 5 s.
 - Everything runs in the browser: one `index.html`, no build step, no server, no API keys.
