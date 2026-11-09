@@ -145,7 +145,7 @@ const hyperliquid = {
   },
   async candles(m, iv, startMs, endMs) {
     const c = await getJSON(HL_REST, { type: "candleSnapshot", req: { coin: m.hist.coin, interval: iv, startTime: startMs, endTime: endMs } });
-    return c.map(x => [x.t, +x.c, +x.h, +x.l, +x.n > 0]);
+    return c.map(x => [x.t, +x.c, +x.h, +x.l, +x.n > 0, +x.v * +x.c]);   // last = $ volume in the bar
   },
 };
 
@@ -220,7 +220,7 @@ const lighter = {
       const r = await getJSON(`${LT_REST}/candles?market_id=${m.hist.marketId}&resolution=${iv}&start_timestamp=${from}&end_timestamp=${end}&count_back=500`);
       const page = r.c || [];
       if (!page.length) break;
-      for (const x of page) rows.set(x.t, [x.t, +x.c, +x.h, +x.l, +x.V > 0]);
+      for (const x of page) rows.set(x.t, [x.t, +x.c, +x.h, +x.l, +x.V > 0, +x.V]);
       const first = Math.floor(page[0].t / 1000);
       if (first >= end) break;
       end = first - 1;
@@ -1333,6 +1333,10 @@ function simulate(op, d, s, gapOf, costs, need) {
   let e = op.i0; while (e <= op.i1 && d.t[e] - op.start < s.react * 60e3) e++;
   while (e <= op.i1 && !(d.act[e] && Math.abs(gapOf(e)) >= need(e))) e++;
   if (e > op.i1 || e >= d.t.length - 1) return { missed: true };
+  // a price only counts if real size traded there: both venues did >= the trade size in the 30 min to entry
+  const usd = s.sizeMode === "usd" ? s.size : s.size * d.pa[e];
+  let va = 0, vb = 0; for (let k = Math.max(0, e - 5); k <= e; k++) { va += d.va[k] || 0; vb += d.vb[k] || 0; }
+  if (va < usd || vb < usd) return { thin: true };
   const side = op.side, deadline = closeDeadline(d.t[e], s);
   let x = -1, reason = "", best = 0, flipped = false;
   for (let k = e + 1; k < d.t.length; k++) {
@@ -1382,8 +1386,8 @@ async function runScan() {
           agentSay("history", `Downloading ${label} (${done + 1} of ${pairs.length})`);
           const [ca, cb] = await Promise.all([getCandles(p.A, s.iv, s.days), getCandles(p.B, s.iv, s.days)]);
           const mapB = new Map(cb.map(r => [r[0], r]));
-          const d = { t: [], pa: [], pb: [], act: [] };
-          for (const r of ca) { const o = mapB.get(r[0]); if (!o) continue; d.t.push(r[0]); d.pa.push(r[1]); d.pb.push(o[1]); d.act.push(!!(r[4] && o[4])); }
+          const d = { t: [], pa: [], pb: [], act: [], va: [], vb: [] };
+          for (const r of ca) { const o = mapB.get(r[0]); if (!o) continue; d.t.push(r[0]); d.pa.push(r[1]); d.pb.push(o[1]); d.act.push(!!(r[4] && o[4])); d.va.push(r[5] || 0); d.vb.push(o[5] || 0); }
           if (d.t.length < 50) { sc.results.push({ p, label, skip: `only ${d.t.length} bars on both venues` }); continue; }
           const gapOf = s.unit === "bps" ? i => (d.pb[i] / d.pa[i] - 1) * 1e4 : i => d.pb[i] - d.pa[i];
 
@@ -1422,15 +1426,16 @@ async function runScan() {
 
           agentSay("sim", `Simulating ${real.length} opportunit${real.length === 1 ? "y" : "ies"} on ${label}`);
           const trades = [];
-          let missed = 0, stillOpen = 0;
+          let missed = 0, stillOpen = 0, thinPrints = 0;
           for (const op of real) {
             const r = simulate(op, d, s, gapOf, costs, need);
             if (r.missed) { missed++; continue; }
+            if (r.thin) { thinPrints++; continue; }
             if (r.open) { stillOpen++; sc.opps.push({ p, label, op, open: true }); continue; }
             trades.push(r); sc.opps.push({ p, label, op, tr: r });
           }
           const conv = trades.filter(t => t.reason !== "deadline");
-          const res = { p, label, d, eps, real, brief, trades, conv, missed, stillOpen, qual, bookNote, costs, crossBps, spreadOnly, medGap,
+          const res = { p, label, d, eps, real, brief, trades, conv, missed, stillOpen, thinPrints, qual, bookNote, costs, crossBps, spreadOnly, medGap,
             lim: trades.reduce((x, t) => x + t.netLim, 0), mkt: trades.some(t => t.netMkt == null) ? null : trades.reduce((x, t) => x + t.netMkt, 0) };
           judge(res, s);
           sc.results.push(res);
@@ -1466,7 +1471,7 @@ function judge(r, s) {
     if (r.spreadOnly) why.push(`${r.spreadOnly} window${r.spreadOnly > 1 ? "s" : ""} looked like ${s.entry}+ on mid prices but disappear once you sell at the bid and buy at the ask.`);
   } else {
     const conv = r.conv.length;
-    why.push(`${r.real.length} window${r.real.length > 1 ? "s" : ""} stayed fillable at ${s.entry} ${s.unit} (after paying ${r.crossBps.toFixed(1)} bps to cross both books) for over ${fmtDur(s.minWin * 60e3)}.${r.spreadOnly ? ` ${r.spreadOnly} more looked like gaps on mid prices but were only the spreads.` : ""} ${t.length} could be taken after your ${s.react}-minute reaction${r.missed ? `, ${r.missed} closed before you could act` : ""}${r.stillOpen ? `, ${r.stillOpen} still open now` : ""}.`);
+    why.push(`${r.real.length} window${r.real.length > 1 ? "s" : ""} stayed fillable at ${s.entry} ${s.unit} (after paying ${r.crossBps.toFixed(1)} bps to cross both books) for over ${fmtDur(s.minWin * 60e3)}.${r.spreadOnly ? ` ${r.spreadOnly} more looked like gaps on mid prices but were only the spreads.` : ""} ${t.length} could be taken after your ${s.react}-minute reaction${r.missed ? `, ${r.missed} closed before you could act` : ""}${r.thinPrints ? `, ${r.thinPrints} left out because one venue traded less than your size around entry (a few small prints, not a fillable price)` : ""}${r.stillOpen ? `, ${r.stillOpen} still open now` : ""}.`);
     if (t.length) why.push(`${conv} of ${t.length} converged before your deadline${t.length - conv ? `; ${t.length - conv} had to be closed unconverged` : ""}. Median time to close: ${fmtDur(median(t.map(x => x.hours)) * 3600e3)}.`);
     if (t.length) why.push(`With limit orders: ${fmtUsd2(r.lim)} (${wins} of ${t.length} won). With market orders: ${r.mkt == null ? "the book is too thin to fill your size" : fmtUsd2(r.mkt)}${r.mkt != null && r.lim > 0 ? `, so taker fees and crossing the book eat ${Math.round(Math.min(999, (r.lim - r.mkt) / r.lim * 100))}% of the profit` : ""}.`);
     const mwins = t.filter(x => x.netMkt > 0).length;

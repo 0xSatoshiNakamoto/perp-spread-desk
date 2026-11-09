@@ -1,0 +1,55 @@
+# Posts the Perp Spread Desk session summary to X twice a day.
+# Until the four X_* secrets are added (Settings → Secrets and variables → Actions), it runs as a dry run:
+# the posts are printed in the run log and nothing is sent.
+name: X posts
+
+on:
+  schedule:
+    - cron: "7 6 * * *"    # 09:07 Istanbul (UTC+3): overnight summary
+    - cron: "7 18 * * *"   # 21:07 Istanbul: daytime summary
+  workflow_dispatch:
+    inputs:
+      post:
+        description: "Actually post to X (otherwise dry run)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write          # to save bot/history.json
+
+concurrency:
+  group: x-posts
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Scan and post
+        env:
+          TZ: Europe/Istanbul
+          X_API_KEY: ${{ secrets.X_API_KEY }}
+          X_API_SECRET: ${{ secrets.X_API_SECRET }}
+          X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
+          X_ACCESS_SECRET: ${{ secrets.X_ACCESS_SECRET }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.post }}" = "true" ]; then
+            node bot/run.mjs --post
+          else
+            node bot/run.mjs
+          fi
+
+      - name: Save history
+        if: always()
+        run: |
+          git config user.name "perp-spread-desk-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bot/history.json || true
+          git diff --cached --quiet || (git commit -m "Bot: session summary $(date -u +%Y-%m-%dT%H:%MZ)" && git push)

@@ -38,3 +38,13 @@ Results use last-trade candle prices plus today's books; check the live books be
 
 Variational quotes can be 20–80 s old; quotes older than the "Max quote age" setting are left out of gap numbers.
 Pre-IPO markets price off each venue's own order book, so their gaps are not guaranteed to close.
+
+## X bot
+
+`bot/run.mjs` runs the same scanner without a browser and writes a two-post thread:
+the last 12 hours of fillable gaps (stocks, indices, FX, commodities on Hyperliquid and Lighter),
+the best one with its market-order result after fees, and what was thrown out (spread-only gaps,
+gaps on venues that traded less than the trade size). `.github/workflows/x-posts.yml` runs it at
+09:07 and 21:07 Istanbul time. Without the `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN` and
+`X_ACCESS_SECRET` repository secrets it only prints the posts (dry run). Test locally with
+`node bot/run.mjs`.
