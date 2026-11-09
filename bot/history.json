@@ -1,1 +1,42 @@
-[]
+[
+ {
+  "at": "2026-11-09T06:36:58.909Z",
+  "posted": false,
+  "session": "morning",
+  "from": 1794163018907,
+  "to": 1794206218907,
+  "opportunities": 4,
+  "closed": 4,
+  "total": 95.42,
+  "spreadOnly": 65,
+  "thinPrints": 3,
+  "pairs": 50,
+  "best": [
+   {
+    "asset": "NVDA",
+    "venues": "sell HL io / buy HL xyz",
+    "net": 51.62,
+    "fillIn": 64,
+    "reason": "converged"
+   },
+   {
+    "asset": "SAMSUNG",
+    "venues": "sell Lighter / buy HL xyz",
+    "net": 34.69,
+    "fillIn": 10.9,
+    "reason": "flipped"
+   },
+   {
+    "asset": "NVDA",
+    "venues": "sell HL io / buy Lighter",
+    "net": 6.07,
+    "fillIn": 18.7,
+    "reason": "converged"
+   }
+  ],
+  "posts": [
+   "Perp Spread Desk · Mon 9 Nov\nOvernight, 21:36–09:36 (Istanbul)\n\n4 gaps of 10+ bps stayed fillable for 1h+ (after crossing both books). 4 closed at 3 bps.\n\nBest: NVDA, sell HL io / buy HL xyz, 64 bps → 2 in 1.8h: +$52 on $10k a side, market orders after fees.",
+   "Also: Samsung +$35, NVDA +$6, SNDK +$3. Total +$95.\n\nThrown out over the last 3 days: 65 \"gaps\" that were only the bid/ask spreads and 3 where one venue traded less than $10k around entry.\n\nSimulated, not trades. Not financial advice.\nLive desk: link in bio."
+  ]
+ }
+]
