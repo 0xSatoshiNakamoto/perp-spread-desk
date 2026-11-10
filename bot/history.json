@@ -1,5 +1,23 @@
 [
  {
+  "at": "2026-11-10T01:27:21.610Z",
+  "posted": false,
+  "session": "morning",
+  "from": 1794230841602,
+  "to": 1794274041602,
+  "opportunities": 0,
+  "closed": 0,
+  "total": 0,
+  "spreadOnly": 72,
+  "thinPrints": 3,
+  "pairs": 53,
+  "best": [],
+  "posts": [
+   "Perp Spread Desk · Tue 10 Nov\nOvernight, 16:27–04:27 (Istanbul)\n\nNo gap of 10+ bps stayed fillable for 1h+ across 53 stock, index, FX and commodity pairs on Hyperliquid and Lighter.",
+   "Thrown out over the last 3 days: 72 \"gaps\" that were only the bid/ask spreads and 3 where one venue traded less than $10k around entry.\n\nSimulated, not trades. Not financial advice.\nLive desk: link in bio."
+  ]
+ },
+ {
   "at": "2026-11-09T06:36:58.909Z",
   "posted": false,
   "session": "morning",
