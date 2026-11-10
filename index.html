@@ -190,6 +190,27 @@ td .g { display: block; font-size: 11px; }
 .feed li.venue { box-shadow: inset 3px 0 0 var(--warn); }
 .feed li.new { animation: flashUp 1.4s ease-out; }
 
+/* ---------- opportunity map ---------- */
+.map-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; }
+.map-stage { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start; }
+.map-wrap { position: relative; height: min(72vh, 760px); min-height: 420px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: #05090b; touch-action: none; }
+.map-wrap canvas { display: block; cursor: grab; }
+.map-wrap canvas:active { cursor: grabbing; }
+.map-tip { position: absolute; z-index: 3; max-width: 220px; padding: 8px 10px; border-radius: 6px; background: rgba(10,19,21,.94); border: 1px solid rgba(95,224,189,.35); color: #e4f2ef; font-size: 12.5px; line-height: 1.45; pointer-events: none; }
+.map-tip .muted { color: #8fa9a5; }
+.map-legend { position: absolute; left: 12px; bottom: 10px; right: 12px; display: grid; gap: 4px; font-size: 12px; color: #cfe2de; pointer-events: none; }
+.map-legend .muted { color: #8fa9a5; }
+#mapCounts { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+#mapCounts i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: -1px; }
+.map-panel { width: 400px; max-height: min(72vh, 760px); overflow-y: auto; }
+.map-panel h3 { margin: 4px 0 0; font-size: 14px; }
+.map-panel .flags { margin: 0; padding-left: 18px; font-size: 12.5px; color: var(--above); }
+.map-panel table { font-size: 12.5px; }
+.map-panel th, .map-panel td { padding: 5px 8px; }
+.ghost-btn { background: transparent !important; color: var(--fg) !important; border: 1px solid var(--line) !important; }
+@media (max-width: 1100px) { .map-stage { grid-template-columns: minmax(0, 1fr); } .map-panel { width: auto; max-height: none; } }
+@media (max-width: 760px) { .map-wrap { height: 62vh; min-height: 360px; } }
+
 /* ---------- scanner ---------- */
 .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 600; border: 1px solid currentColor; }
 .pill.go { color: var(--ok); } .pill.watch { color: var(--warn); } .pill.avoid { color: var(--err); } .pill.na { color: var(--muted); }
@@ -258,6 +279,7 @@ footer.notes b { color: var(--fg); font-weight: 600; }
 <div class="shell">
   <nav class="side" aria-label="Views">
     <a href="#dashboard" data-tab="dashboard"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><rect x="1" y="1" width="6" height="6" rx="1" fill="currentColor"/><rect x="9" y="1" width="6" height="6" rx="1" fill="currentColor"/><rect x="1" y="9" width="6" height="6" rx="1" fill="currentColor"/><rect x="9" y="9" width="6" height="6" rx="1" fill="currentColor"/></svg>Dashboard</a>
+    <a href="#map" data-tab="map"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.6" fill="currentColor"/><ellipse cx="8" cy="8" rx="7" ry="3" fill="none" stroke="currentColor" stroke-width="1.3" transform="rotate(-20 8 8)"/><circle cx="13.6" cy="5.6" r="1.3" fill="currentColor"/></svg>Opportunity map</a>
     <a href="#compare" data-tab="compare"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4h12M2 8h12M2 12h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>Price compare</a>
     <a href="#funding" data-tab="funding"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M8 4.5v7M6 6.2c0-1 1-1.4 2-1.4s2 .5 2 1.4-1 1.2-2 1.5-2 .6-2 1.6 1 1.4 2 1.4 2-.4 2-1.4" fill="none" stroke="currentColor" stroke-width="1.3"/></svg>Funding</a>
     <a href="#divergence" data-tab="divergence"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M1 12 L5 7 L8 9 L15 3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M1 14 L5 11 L8 12.5 L15 9" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" opacity=".6"/></svg>Divergence</a>
@@ -315,6 +337,33 @@ footer.notes b { color: var(--fg); font-weight: 600; }
         <footer><a href="#venues">Venue details</a></footer>
       </section>
     </div>
+  </section>
+
+  <!-- ======================= MAP ======================= -->
+  <section class="view" id="view-map" hidden>
+    <div class="view-title"><h1>Opportunity map</h1><p>Every asset on two or more venues is a planet. Drag to turn, scroll or pinch to zoom, click a planet to see what is happening.</p></div>
+    <div class="map-bar">
+      <label class="field" for="mapSize" style="grid-auto-flow:column;align-items:center;gap:6px"><span>Planet size</span>
+        <select id="mapSize"><option value="opps" selected>Opportunities found by the scanner</option><option value="gap">Fill gap right now</option></select></label>
+      <button class="linkish" type="button" id="mapSpin" aria-pressed="true">Auto-rotate</button>
+      <button class="linkish" type="button" id="mapReset">Reset view</button>
+      <span class="hint" id="mapStatus"></span>
+    </div>
+    <div class="map-stage">
+      <div class="map-wrap" id="mapWrap">
+        <canvas id="mapCanvas" role="img" aria-label="Orbiting planets, one per asset; size shows how many opportunities the scanner found, colour shows whether a gap can be filled right now. Use the list below the map to pick one with the keyboard."></canvas>
+        <div class="map-tip" id="mapTip" hidden></div>
+        <div class="map-legend">
+          <div id="mapCounts"></div>
+          <div class="muted">Bigger = more opportunities · moons = venues listing it · rings = asset type</div>
+        </div>
+      </div>
+      <aside class="map-panel widget" id="mapPanel" hidden aria-live="polite">
+        <header><h2>Planet</h2><div class="tools"><button class="linkish" type="button" id="mapClose" aria-label="Close panel">Close</button></div></header>
+        <div id="mapPanelBody" style="padding:12px 14px;display:grid;gap:10px"></div>
+      </aside>
+    </div>
+    <div class="field"><span>Biggest planets (keyboard friendly)</span><div class="chips" id="mapList"></div></div>
   </section>
 
   <!-- ======================= COMPARE ======================= -->
@@ -468,5 +517,6 @@ footer.notes b { color: var(--fg); font-weight: 600; }
 
 <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.32/dist/uPlot.iife.min.js" integrity="sha384-Gx3t0zdBAuQOuvvmaLZj7HKEiSgWTAs+VdtNY7wt19QDPTDQjFIwAuXDj0zeN00c" crossorigin="anonymous"></script>
 <script src="app.js"></script>
+<script src="map.js"></script>
 </body>
 </html>

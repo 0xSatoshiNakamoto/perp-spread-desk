@@ -773,6 +773,7 @@ function renderCurrent() {
   else if (currentTab === "funding") renderFunding();
   else if (currentTab === "divergence") { renderDvSelectors(); dvLiveTick(); }
   else if (currentTab === "venues") renderVenues();
+  else if (currentTab === "map") window.mapRender?.();
   else if (currentTab === "scanner") { if (!sc.agents.finder) { renderAgents(); renderScanResults(); scRuleHint(); } liveCheck(false); }
 }
 
@@ -1677,13 +1678,14 @@ document.getElementById("scLiveBtn").addEventListener("click", () => liveCheck(t
 /* =============================================================================================
    ROUTING, THEME, START
    ============================================================================================= */
-const TABS = ["dashboard", "compare", "funding", "divergence", "scanner", "venues"];
+const TABS = ["dashboard", "map", "compare", "funding", "divergence", "scanner", "venues"];
 function route() {
   const t = (location.hash || "#dashboard").slice(1);
   currentTab = TABS.includes(t) ? t : "dashboard";
   for (const s of TABS) document.getElementById("view-" + s).hidden = s !== currentTab;
   document.querySelectorAll(".side a").forEach(a => { if (a.dataset.tab === currentTab) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
   mon.series = null;
+  window.mapRoute?.(currentTab);
   renderCurrent();
   if (currentTab === "divergence" && !dv.data && state.views.size) setTimeout(() => { renderDvSelectors(); if (!dv.data) loadDivergence(); }, 0);
 }

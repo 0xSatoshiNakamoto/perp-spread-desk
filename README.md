@@ -6,6 +6,14 @@ that logs when a gap opens or closes.
 
 Live site: https://0xsatoshinakamoto.github.io/perp-spread-desk/
 
+## Opportunity map
+
+`map.js` draws every asset listed on 2+ venues as a planet orbiting in rings by asset type
+(stocks, indices, FX, commodities, pre-IPO, crypto). Planet size = opportunities the scanner found;
+colour = the fill gap right now (green fillable, amber fillable under the entry level or on an old quote,
+grey inside the spreads); moons = venues. Drag to turn, scroll or pinch to zoom, click for live details.
+Plain 2D canvas with a small perspective projection, no 3D library.
+
 ## Arb scanner
 
 Eight rule-based agents run in the browser and follow a gap-trading rule:
