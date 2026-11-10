@@ -297,7 +297,7 @@
       `<span><i style="background:${COL.inside}"></i>Inside the spreads (${n("inside")})</span><span><i style="background:${COL.none}"></i>No bid/ask (${n("none")})</span>`;
     const st = document.getElementById("mapStatus");
     if (sc.running) st.textContent = `Agents are scanning: ${(sc.agents.history && sc.agents.history.msg) || "starting"}. Planets grow as results come in.`;
-    else if (!sc.results.length) st.textContent = "No scan yet: planets are all small. Starting a scan of the last 7 days…";
+    else if (!sc.results.length) st.textContent = "Waiting for every venue to report, then the agents scan the last 7 days. Planets grow as results come in.";
     else st.textContent = `Sizes from the scan of the last ${document.getElementById("scDays").value} days (${sc.results.filter(r => !r.skip).length} pairs). ${[...stats.values()].reduce((s, o) => s + o.windows, 0)} opportunities in total.`;
   }
   function renderList() {
@@ -307,6 +307,10 @@
   }
 
   /* ---------------- lifecycle ---------------- */
+  // only auto-scan once every venue has delivered its market list, or the scan misses pairs
+  const venuesReady = () => VENUES.every(v => state.venueStatus[v.id]?.lastMsg || state.venueStatus[v.id]?.state === "err")
+    && [...state.markets.values()].some(m => m.venue === "lighter" && m.lighterCat) && Date.now() - state.startedAt > 8000;
+  const maybeScan = () => { if (!sc.results.length && !sc.running && venuesReady()) runScan(); };
   function resize() {
     const b = wrap.getBoundingClientRect();
     M.dpr = Math.min(2, window.devicePixelRatio || 1); M.w = b.width; M.h = b.height;
@@ -317,13 +321,13 @@
   function start() {
     if (M.running) return;
     M.running = true; resize(); refreshData();
-    if (!sc.results.length && !sc.running && state.views.size) runScan();
+    maybeScan();
     requestAnimationFrame(draw);
   }
   function stop() { M.running = false; tip.hidden = true; }
   document.addEventListener("visibilitychange", () => { if (document.hidden) stop(); else if (currentTab === "map") start(); });
   // hooks called by app.js
   window.mapRoute = tab => (tab === "map" ? start() : stop());
-  window.mapRender = () => { if (!M.running) return; refreshData(); if (!sc.results.length && !sc.running && state.views.size > 20) runScan(); };
+  window.mapRender = () => { if (!M.running) return; refreshData(); maybeScan(); };
   if (currentTab === "map") start();
 })();
