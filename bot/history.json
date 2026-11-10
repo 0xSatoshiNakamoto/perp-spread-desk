@@ -1,5 +1,38 @@
 [
  {
+  "at": "2026-11-10T14:46:53.011Z",
+  "posted": false,
+  "session": "evening",
+  "from": 1794278813009,
+  "to": 1794322013009,
+  "opportunities": 2,
+  "closed": 2,
+  "total": 24.55,
+  "spreadOnly": 76,
+  "thinPrints": 6,
+  "pairs": 56,
+  "best": [
+   {
+    "asset": "UNITREE",
+    "venues": "sell Lighter / buy HL xyz",
+    "net": 22.19,
+    "fillIn": 36.3,
+    "reason": "converged"
+   },
+   {
+    "asset": "UNITREE",
+    "venues": "sell Lighter / buy HL xyz",
+    "net": 2.36,
+    "fillIn": 16.3,
+    "reason": "converged"
+   }
+  ],
+  "posts": [
+   "Perp Spread Desk · Tue 10 Nov\nDaytime, 05:46–17:46 (Istanbul)\n\n2 gaps of 10+ bps stayed fillable for 1h+ (after crossing both books). 2 closed at 3 bps.\n\nBest: UNITREE, sell Lighter / buy HL xyz, 36 bps → 1 in 8.0h: +$22 on $10k a side, market orders after fees.",
+   "Also: UNITREE +$2. Total +$25.\n\nThrown out over the last 3 days: 76 \"gaps\" that were only the bid/ask spreads and 6 where one venue traded less than $10k around entry.\n\nSimulated, not trades. Not financial advice.\nLive desk: link in bio."
+  ]
+ },
+ {
   "at": "2026-11-10T01:27:21.610Z",
   "posted": false,
   "session": "morning",
