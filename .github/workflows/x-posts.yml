@@ -35,6 +35,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main          # latest main at run time, so a queued run sees the history the previous run saved
 
       - uses: actions/setup-node@v4
         with:
