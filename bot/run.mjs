@@ -391,6 +391,8 @@ function section(title, lines, footer = "") {
   return [footer ? cur + "\n\n" + footer : cur];
 }
 
+const sesProse = (t, name = sessionName(t)) => ({ Asia: "Asian hours", Europe: "European hours", US: "US market hours", "US after-hours": "US after-hours", weekend: "the weekend" })[name] || name;
+
 function compose(scan, slot = slotOf()) {
   const now = slot, from = slot - 12 * 3600e3;                            // each report covers the 12 hours ending at its slot
   const inRange = t => t >= from && t < now;
@@ -400,86 +402,119 @@ function compose(scan, slot = slotOf()) {
   const all = clean.flatMap(r => r.trades.map(t => ({ ...t, r })));
   const inWin = all.filter(t => inRange(t.tIn) && !t.open).sort((a, b) => b.net - a.net);
   const last3 = all.filter(t => !t.open && t.tIn < now);
-  const openNow = all.filter(t => t.open);
   const total = inWin.reduce((s, t) => s + t.net, 0);
   const spreadOnly = scan.results.reduce((s, r) => s + r.spreadOnly, 0);
   const thinPrints = scan.results.reduce((s, r) => s + r.thinPrints, 0);
   const nPairs = scan.results.length;
-  const short = m => m.name.replace("Hyperliquid ", "HL ");
-  const pairName = p => `${nice(p.canon)} · ${short(p.A)} / ${short(p.B)}`;
+  const isNight = new Date(now).getUTCHours() < 12;
+  const period = isNight ? "Overnight" : "Daytime";
+  const span = `${hhmm(from)}–${hhmm(now)} UTC`;
+  // prose venue names: "Paragon on Hyperliquid", "Lighter"
+  const vn = m => m.venue === "hl" ? (m.ex === "hl" ? "Hyperliquid" : `${m.name.replace("Hyperliquid ", "")} on Hyperliquid`) : m.name;
+  const vs = m => m.name.replace("Hyperliquid ", "");                     // short: "Paragon", "XYZ", "Lighter"
   const rich = t => t.side > 0 ? { m: t.r.p.B, i: 1 } : { m: t.r.p.A, i: 0 };
   const cheap = t => t.side > 0 ? { m: t.r.p.A, i: 0 } : { m: t.r.p.B, i: 1 };
   const posts = [];
 
-  // 1. header + scoreboard
-  const wins3 = last3.filter(t => t.net > 0).length, net3 = last3.reduce((s, t) => s + t.net, 0);
-  posts.push(`Perp gap report · ${dayName(now)}, ${hhmm(from)}–${hhmm(now)} UTC\n\n` +
-    `Same asset, different price per venue. ${nPairs} pairs (stocks, indices, FX, commodities) on Hyperliquid + Lighter.\n\n` +
-    `• Tradeable gaps: ${inWin.length}${inWin.length ? ` (${usd(total)} on $10k/leg)` : ""}\n` +
-    `• Fake gaps thrown out (3d): ${spreadOnly + thinPrints}\n` +
-    `• 3-day record: ${last3.length} trades, ${wins3} green, ${usd(net3)}`);
+  // ---- 1. what this is, then the headline
+  const intro = `Same stock, two exchanges, two prices. I track ${nPairs} stock, index, FX and commodity perps on Hyperliquid and Lighter to see if those gaps can actually be traded after fees and spreads.`;
+  let headline;
+  if (inWin.length) {
+    const names = [...new Set(inWin.map(t => nice(t.r.p.canon)))];
+    headline = `${period} (${span}): ${inWin.length === 1 ? `one trade cleared the bar, in ${names[0]}` : `${inWin.length} trades cleared the bar (${names.slice(0, 3).join(", ")}), ${usd(total)} combined on $10k a side`}.`;
+  } else {
+    headline = `${period} (${span}): nothing cleared the bar. The gaps that showed up were too small to survive the cost of crossing both books.`;
+  }
+  posts.push(`${intro}\n\n${headline}`);
 
-  // 2. each trade, full breakdown
-  for (const t of inWin.slice(0, 3)) {
-    const R = rich(t), C = cheap(t);
-    const exitTxt = t.reason === "flipped" ? `flipped to ${pct(Math.abs(t.gOut))} the other way` : t.reason === "deadline" ? `still ${pct(Math.abs(t.gOut))}, closed at end of day` : `converged to ${pct(Math.abs(t.gOut))}`;
-    posts.push(`${nice(t.r.p.canon)} · ${short(R.m)} rich vs ${short(C.m)}\n\n` +
-      `Entry ${hhmm(t.tIn)} UTC (${sessionName(t.tIn)}): short ${short(R.m)} ${px(t.pxIn[R.i])}, long ${short(C.m)} ${px(t.pxIn[C.i])}\n` +
-      `Gap ${pct(Math.abs(t.gIn))} (peak ${pct(t.peak)}), open 1h+ before entry\n` +
-      `Exit ${hhmm(t.tOut)} UTC, ${dur(t.hours)} later: ${exitTxt}\n\n` +
-      `Gross ${usd(t.grossUsd)} · fees −$${Math.round(t.feeUsd)} · book cost −$${Math.round(t.bookUsd)}${t.costSrc.every(x => x === "measured") ? "" : " (est.)"} · net ${usd(Math.round(t.grossUsd) - Math.round(t.feeUsd) - Math.round(t.bookUsd))}`);
+  // ---- 2. the best trade, told as a story
+  if (inWin.length) {
+    const t = inWin[0], R = rich(t), C = cheap(t);
+    const exitTxt = t.reason === "flipped" ? `closed and overshot by ${pct(Math.abs(t.gOut))}`
+      : t.reason === "deadline" ? `was still ${pct(Math.abs(t.gOut))} wide at the end of the day, so it was closed there`
+      : `closed to ${pct(Math.abs(t.gOut))}`;
+    const costs = Math.round(t.feeUsd) + Math.round(t.bookUsd);
+    const both = R.m.venue === "hl" && C.m.venue === "hl" && R.m.ex !== "hl" && C.m.ex !== "hl";
+    const lst = m => m.venue === "hl" && m.ex !== "hl" ? `Hyperliquid's ${vs(m)} listing` : vn(m);
+    const who = both ? `Hyperliquid's ${vs(R.m)} listing traded ${pct(Math.abs(t.gIn))} above ${vs(C.m)}'s` : `${lst(R.m)} traded ${pct(Math.abs(t.gIn))} above ${lst(C.m)}`;
+    posts.push(`${nice(t.r.p.canon)}: ${who} for 1h+ during ${sesProse(t.tIn)}` +
+      (t.peak > Math.abs(t.gIn) * 1.2 ? `, peaking at ${pct(t.peak)}` : "") + `.\n\n` +
+      `Short ${vs(R.m)} at ${px(t.pxIn[R.i])}, long ${vs(C.m)} at ${px(t.pxIn[C.i])}. The gap ${exitTxt} within ${dur(t.hours)}.\n\n` +
+      `On $10k a side: ${usd(t.grossUsd)} gross, −$${costs} fees and spread${t.costSrc.every(x => x === "measured") ? "" : " (est.)"}, ${usd(Math.round(t.grossUsd) - costs)} net.`);
   }
 
-  // 3. near misses: the gap held for an hour, but the books ate it
+  // ---- 3. what it means: the most useful observations, ranked
+  const notes = [];
+  // a) near misses, when there was no trade (or one stands out)
   const nearBy = new Map();
   for (const r of clean) for (const w of r.loose) {
     if (w.real || !inRange(w.start) || !(w.held >= CFG.entry * 0.5) || w.held >= w.need) continue;
-    if (inWin.some(t => t.r === r)) continue;                              // pair already traded this window: not a "miss"
+    if (inWin.some(t => t.r === r)) continue;
     const k = r.p.canon + r.p.A.ex + r.p.B.ex, o = nearBy.get(k);
     if (!o || w.held > o.w.held) nearBy.set(k, { r, w });
   }
-  const near = [...nearBy.values()].sort((a, b) => (b.w.held - b.w.need) - (a.w.held - a.w.need)).slice(0, 4);
-  if (near.length) posts.push(...section(`Near misses: the gap held 1h, but not enough to cover crossing both books + 0.10% edge:`,
-    near.map(({ r, w }) => `• ${pairName(r.p)}: held ${pct(w.held)}, needed ${pct(w.need)}`)));
-
-  // 4. venue map: who trades rich, whose books are expensive
-  const prem = new Map(), cost = new Map(), seen = new Set();
+  const near = [...nearBy.values()].sort((a, b) => (a.w.need - a.w.held) - (b.w.need - b.w.held));
+  if (near.length) {
+    const { r, w } = near[0];
+    notes.push({ score: inWin.length ? 2 : 5, text: `Closest miss: ${nice(r.p.canon)}, ${vs(r.p.A)} vs ${vs(r.p.B)}, held a ${pct(w.held)} gap for an hour but needed ${pct(w.need)} to pay for crossing both books.` });
+  }
+  // b) a venue that is persistently rich, and whether its books let you use it
+  const prem = new Map(), bookCost = new Map(), seen = new Set();
   for (const r of clean) {
     const ix = r.d.t.map((t, i) => i).filter(i => inRange(r.d.t[i]) && r.d.act[i]);
     if (ix.length < 24) continue;
-    const m = median(ix.map(i => r.g(i)));                                // B vs A, in bps
-    for (const [v, x] of [[r.p.B, m], [r.p.A, -m]]) { if (!prem.has(short(v))) prem.set(short(v), []); prem.get(short(v)).push(x); }
-    for (const [v, rt] of [[r.p.A, r.rtA], [r.p.B, r.rtB]]) { const k = v.ex + v.id; if (seen.has(k)) continue; seen.add(k); if (!cost.has(short(v))) cost.set(short(v), []); cost.get(short(v)).push(rt); }
+    const m = median(ix.map(i => r.g(i)));
+    for (const [v, x] of [[r.p.B, m], [r.p.A, -m]]) { const k = vs(v); if (!prem.has(k)) prem.set(k, { m: v, xs: [] }); prem.get(k).xs.push(x); }
+    for (const [v, rt] of [[r.p.A, r.rtA], [r.p.B, r.rtB]]) { const k = v.ex + v.id; if (seen.has(k)) continue; seen.add(k); if (!bookCost.has(vs(v))) bookCost.set(vs(v), []); bookCost.get(vs(v)).push(rt); }
   }
-  const venues = [...prem].filter(([, xs]) => xs.length >= 3).map(([v, xs]) => ({ v, m: median(xs), n: xs.length })).sort((a, b) => b.m - a.m);
-  const books = [...cost].filter(([, xs]) => xs.length >= 2).map(([v, xs]) => ({ v, m: median(xs), n: xs.length })).sort((a, b) => a.m - b.m);
-  if (venues.length >= 2) posts.push(...section(`Venue map: median premium vs the same asset elsewhere`,
-    venues.map(x => `• ${x.v} ${sgnPct(x.m)} (${x.n} pairs)`),
-    books.length ? `Buy + sell $10k now costs (median):\n${books.map(x => `${x.v.replace("HL ", "")} ${pct(x.m)}`).join(" · ")}` : ""));
-
-  // 5. funding carry: realized averages over the window
+  const venues = [...prem.values()].filter(x => x.xs.length >= 3).map(x => ({ m: x.m, med: median(x.xs), n: x.xs.length })).sort((a, b) => b.med - a.med);
+  const cheapest = [...bookCost].map(([v, xs]) => ({ v, c: median(xs) })).filter(x => Number.isFinite(x.c)).sort((a, b) => a.c - b.c);
+  if (venues.length >= 2 && Math.abs(venues[0].med) >= 8) {
+    const top = venues[0], c = median(bookCost.get(vs(top.m)) || []);
+    const lo = cheapest[0];
+    notes.push({ score: 4, text: `${top.m.venue === "hl" && top.m.ex !== "hl" ? `Hyperliquid's ${vs(top.m)} market` : vn(top.m)} is the rich venue: its listings sat a median ${pct(top.med)} above the same assets elsewhere.` +
+      (Number.isFinite(c) && lo ? ` But its books cost ${pct(c)} to get in and out of $10k, vs ${pct(lo.c)} on ${lo.v}, ${c >= top.med ? "which wipes out the whole premium" : c >= top.med * 0.5 ? "which eats most of it" : "so there is still room to work with"}.` : "") });
+  }
+  // c) funding: realized carry vs how much the price gap itself moved
   const apr = f => f * 24 * 365 * 100;
   const carry = scan.results.filter(r => Number.isFinite(r.fA) && Number.isFinite(r.fB))
-    .map(r => ({ r, diff: r.fB - r.fA })).sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff)).slice(0, 3);
-  if (carry.length && Math.abs(apr(carry[0].diff)) >= 5) posts.push(...section(`Funding carry: avg rate paid these 12h, as APR. Short the higher leg, long the lower:`,
-    carry.map(({ r, diff }) => { const [hi, lo, fh, fl] = diff > 0 ? [r.p.B, r.p.A, r.fB, r.fA] : [r.p.A, r.p.B, r.fA, r.fB];
-      return `• ${nice(r.p.canon)}: ${short(hi)} ${apr(fh).toFixed(0)}% vs ${short(lo)} ${apr(fl).toFixed(0)}% → ${Math.abs(apr(diff)).toFixed(0)}% ≈ $${(Math.abs(diff) * 24 * 1e4).toFixed(0)}/day per $10k`; }),
-    `Rates move hourly; the price gap between legs can outweigh the carry.`));
+    .map(r => ({ r, diff: r.fB - r.fA })).sort((a, b) => Math.abs(b.diff) - Math.abs(a.diff));
+  if (carry.length && Math.abs(apr(carry[0].diff)) >= 20) {
+    const { r, diff } = carry[0];
+    const [hi, lo, fh, fl] = diff > 0 ? [r.p.B, r.p.A, r.fB, r.fA] : [r.p.A, r.p.B, r.fA, r.fB];
+    const ix = r.d.t.map((t, i) => i).filter(i => inRange(r.d.t[i]) && r.d.act[i]);
+    const gs = ix.map(i => r.g(i)), swing = gs.length ? Math.max(...gs) - Math.min(...gs) : NaN;
+    const perDay = Math.abs(diff) * 24 * 1e4;
+    const crowd = fh < 0 && fl < 0 ? ` Shorts pay on both venues: a crowded short.` : fh > 0 && fl > 0 ? ` Longs pay on both venues: a crowded long.` : "";
+    notes.push({ score: 3, text: `Funding: ${nice(r.p.canon)} paid ${apr(fh).toFixed(0)}% a year on ${vs(hi)} vs ${apr(fl).toFixed(0)}% on ${vs(lo)}.${crowd} The carry is worth ≈$${perDay.toFixed(0)}/day per $10k` +
+      (Number.isFinite(swing) && swing > 0 ? `, but the price gap between those two swung ${pct(swing)} (≈$${Math.round(swing)}) in the same 12h.` : ".") });
+  }
+  // d) where trades come from
+  if (last3.length >= 4) {
+    const bySes = {}; for (const t of last3) bySes[sessionName(t.tIn)] = (bySes[sessionName(t.tIn)] || 0) + 1;
+    const [topS, topN] = Object.entries(bySes).sort((a, b) => b[1] - a[1])[0];
+    if (topN / last3.length >= 0.5) notes.push({ score: 2.5, text: `Pattern: ${topN} of the last ${last3.length} trades started during ${sesProse(null, topS)}.` });
+  }
+  // e) the filter is the point
+  if (spreadOnly + thinPrints >= 10) notes.push({ score: 1, text: `For scale: ${spreadOnly + thinPrints} "gaps" in the last 3 days looked real on a price chart and weren't. ${spreadOnly} were just the bid/ask spread, ${thinPrints} were a few trades under $10k.` });
+  if (flaggedWins.length) notes.push({ score: 1.5, text: `Ignored ${nice(flaggedWins[0].p.canon)} on ${vs(flaggedWins[0].p.A)}/${vs(flaggedWins[0].p.B)}: ${flaggedWins[0].quality.flags[0] || "data looked unreliable"}, more likely a bad print than a real gap.` });
+  notes.sort((a, b) => b.score - a.score);
+  // at most two posts of observations; a note that doesn't fit is dropped rather than padded
+  const notePosts = [""];
+  for (const n of notes) {
+    const i = notePosts.length - 1, next = notePosts[i] ? notePosts[i] + "\n\n" + n.text : n.text;
+    if (xLen(next) <= 280) notePosts[i] = next; else if (notePosts.length < 2 && n.score >= 2.5) notePosts.push(n.text);
+  }
+  posts.push(...notePosts.filter(Boolean));
 
-  // 6. when gaps happen + flags + what's open
-  const bySes = {}; for (const t of last3) bySes[sessionName(t.tIn)] = (bySes[sessionName(t.tIn)] || 0) + 1;
-  posts.push(...pack([
-    last3.length ? `Where the last 3 days' trades started: ${Object.entries(bySes).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(", ")}.` : "",
-    `Thrown out (3d): ${spreadOnly} gaps that were only the bid/ask spread, ${thinPrints} on prints under $10k.`,
-    flaggedWins.length ? `Flagged, not counted: ${flaggedWins.slice(0, 2).map(r => `${pairName(r.p)} (${r.quality.flags.join(", ") || "low quality"})`).join("; ")}.` : "",
-    openNow.length ? `Open now: ${[...new Set(openNow.map(t => pairName(t.r.p)))].slice(0, 3).join("; ")}.` : ""]));
-
-  // 7. method
-  posts.push(`Method: 5-min candles. A gap counts if ≥0.10% is left after crossing both books for $10k, for 1h+, with ≥$10k traded on each venue. Entry 15 min late, exit at ≤0.03% or a flip, same day. Market orders + fees. "est." = typical book cost for that hour.\n\nSimulated, not advice.`);
+  // ---- 4. scorecard + method, so the numbers can be judged
+  const wins3 = last3.filter(t => t.net > 0).length, net3 = last3.reduce((s, t) => s + t.net, 0);
+  posts.push(`Scorecard, last 3 days: ${last3.length} trade${last3.length === 1 ? "" : "s"}, ${wins3} profitable, ${usd(net3)} net on $10k a side.\n\n` +
+    `The rule: at least 0.10% left after crossing both order books, held for an hour, real volume on both sides, closed the same day. Market orders, fees included.\n\nSimulated, not advice.`);
 
   for (const p of posts) if (xLen(p) > 280) console.error(`WARNING: post is ${xLen(p)} chars, will be cut:\n${p}`);
-  return { session: `${hhmm(from)}–${hhmm(now)} UTC`, posts: posts.map(p => fit(p, 280)), stats: { from, to: now, opportunities: inWin.length, total: +total.toFixed(2), spreadOnly, thinPrints, pairs: nPairs,
-    best: inWin.slice(0, 3).map(t => ({ asset: t.r.p.canon, rich: rich(t).m.name, cheap: cheap(t).m.name, net: +t.net.toFixed(2), grossUsd: +t.grossUsd.toFixed(2), feeUsd: +t.feeUsd.toFixed(2), bookUsd: +t.bookUsd.toFixed(2), crossBps: +t.crossBps.toFixed(1), reason: t.reason, tIn: t.tIn, tOut: t.tOut })) } };
+  return { session: span, posts: posts.map(p => fit(p, 280)), stats: { from, to: now, opportunities: inWin.length, total: +total.toFixed(2), spreadOnly, thinPrints, pairs: nPairs,
+    best: inWin.slice(0, 3).map(t => ({ asset: t.r.p.canon, rich: rich(t).m.name, cheap: cheap(t).m.name, net: +t.net.toFixed(2), grossUsd: +t.grossUsd.toFixed(2), feeUsd: +t.feeUsd.toFixed(2), bookUsd: +t.bookUsd.toFixed(2), crossBps: +t.crossBps.toFixed(1), reason: t.reason, tIn: t.tIn, tOut: t.tOut, costSrc: t.costSrc })) } };
 }
 
 /* ------------------------------------------------------------------ X API (OAuth 1.0a user context) */
