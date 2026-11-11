@@ -7,7 +7,7 @@
 //   a window counts when the FILLABLE gap (sell the rich venue at its bid, buy the cheap one at its ask,
 //   after paying to cross both books for the trade size) is >= ENTRY bps for >= MIN_WINDOW minutes;
 //   you act REACT minutes after it appears, close at <= EXIT bps or on a flip, the same day.
-//   Results are market orders: taker fees + today's book impact.
+//   Results are market orders: taker fees + book impact (median of the saved order-book checks for that pair, bot/costs.json).
 // No dependencies: Node 20+ (global fetch, crypto).
 
 import crypto from "node:crypto";
@@ -19,10 +19,12 @@ const CFG = {
   tz: process.env.TZ || "Europe/Istanbul",
   site: "0xsatoshinakamoto.github.io/perp-spread-desk",
   historyFile: new URL("./history.json", import.meta.url),
+  costsFile: new URL("./costs.json", import.meta.url),   // past order-book checks per pair, so costs don't swing with one snapshot
 };
 const POST = process.argv.includes("--post");
 const SLOTTED = process.argv.includes("--slot");   // scheduled runs: post once per slot, whenever the (late) runner gets here
-const SLOT_HOURS = [9, 21];                         // Istanbul time: 09:00 overnight summary, 21:00 daytime summary
+// Post times in UTC. Testing: 06:00 and 18:00 UTC (09:00 / 21:00 Istanbul). Change here and in .github/workflows/x-posts.yml.
+const SLOT_HOURS = (process.env.SLOT_HOURS_UTC || "6,18").split(",").map(Number).sort((a, b) => a - b);
 const MAX_LATE_H = 4;                               // a slot not done within 4h is skipped rather than posted stale
 const HL = "https://api.hyperliquid.xyz/info";
 const LT = "https://mainnet.zklighter.elliot.ai/api/v1";
@@ -77,14 +79,16 @@ function classOf(ms, canon) {
 
 /* ------------------------------------------------------------------ markets */
 async function hlMarkets() {
-  const dexes = [""].concat((await getJSON(HL, { type: "perpDexs" })).filter(Boolean).map(d => d.name));
+  const dexList = (await getJSON(HL, { type: "perpDexs" })).filter(Boolean);
+  const full = Object.fromEntries(dexList.map(d => [d.name, d.fullName || d.name]));
+  const dexes = [""].concat(dexList.map(d => d.name));
   const out = [];
   for (const dex of dexes) {
     const [meta, ctx] = await getJSON(HL, dex ? { type: "metaAndAssetCtxs", dex } : { type: "metaAndAssetCtxs" });
     meta.universe.forEach((a, i) => {
       const c = ctx[i]; if (!c || a.isDelisted) return;
       const s = +a.deployerFeeScale || 0, scale = dex ? (s < 1 ? s + 1 : s * 2) * (a.growthMode === "enabled" ? 0.1 : 1) : 1;
-      out.push({ venue: "hl", ex: dex ? "hl-" + dex : "hl", label: dex ? "HL " + dex : "HL main", id: a.name, ticker: a.name.split(":").pop(),
+      out.push({ venue: "hl", ex: dex ? "hl-" + dex : "hl", label: dex ? "HL " + dex : "HL main", name: dex ? `Hyperliquid ${full[dex]}` : "Hyperliquid", id: a.name, ticker: a.name.split(":").pop(),
         price: +(c.midPx ?? c.markPx), vol: +c.dayNtlVlm, taker: 0.00045 * scale, maker: 0.00015 * scale });
     });
     await sleep(250);
@@ -94,7 +98,7 @@ async function hlMarkets() {
 async function lighterMarkets() {
   const d = await getJSON(`${LT}/orderBookDetails`);
   return d.order_book_details.filter(m => m.status === "active" && m.market_type === "perp").map(m => ({
-    venue: "lighter", ex: "lighter", label: "Lighter", id: String(m.market_id), ticker: m.symbol, price: +m.last_trade_price,
+    venue: "lighter", ex: "lighter", label: "Lighter", name: "Lighter", id: String(m.market_id), ticker: m.symbol, price: +m.last_trade_price,
     vol: +m.daily_quote_token_volume, taker: 0, maker: 0, lighterCat: { strategy: m.strategy_index, fpm: m.funding_premium_multiplier } }));
 }
 function pairsFrom(markets) {
@@ -207,9 +211,11 @@ function analyse(p, rows, crossBps) {
     const q = CFG.size / d.pa[e], notional = q * (d.pa[e] + d.pa[x]) / 2;
     const gross = q * op.side * ((d.pb[e] - d.pa[e]) - (d.pb[x] - d.pa[x]));
     const cost = notional * (2 * (p.A.taker + p.B.taker) + 2 * crossBps / 1e4);
-    trades.push({ tIn: d.t[e], tOut: d.t[x], gIn: g(e), gOut: g(x), fillIn: Math.abs(g(e)) - crossBps, side: op.side, peak: op.peak, net: gross - cost, hours: (d.t[x] - d.t[e]) / 3600e3, reason, weekend: sessionOf(d.t[e]) === "weekend" });
+    trades.push({ tIn: d.t[e], tOut: d.t[x], gIn: g(e), gOut: g(x), fillIn: Math.abs(g(e)) - crossBps, side: op.side, peak: op.peak, net: gross - cost, hours: (d.t[x] - d.t[e]) / 3600e3, reason, weekend: sessionOf(d.t[e]) === "weekend",
+      pxIn: [d.pa[e], d.pb[e]], pxOut: [d.pa[x], d.pb[x]], grossBps: gross / notional * 1e4, costBps: cost / notional * 1e4, grossUsd: gross, costUsd: cost,
+      feeBps: 2 * (p.A.taker + p.B.taker) * 1e4, crossBps });
   }
-  return { trades, spreadOnly, thinPrints, bars: n };
+  return { trades, spreadOnly, thinPrints, bars: n, d, g };
 }
 
 /* ------------------------------------------------------------------ quality guard (same checks as the site) */
@@ -237,6 +243,8 @@ function quality(p, rows) {
 }
 
 /* ------------------------------------------------------------------ run the scan */
+let COSTS = {};
+try { COSTS = JSON.parse(fs.readFileSync(CFG.costsFile, "utf8")); } catch { }
 async function scan() {
   const [hl, lt] = await Promise.all([hlMarkets(), lighterMarkets().catch(e => { console.error("Lighter unavailable:", e.message); return []; })]);
   const pairs = pairsFrom([...hl, ...lt]);
@@ -250,7 +258,12 @@ async function scan() {
       const [ba, bb] = [await book(p.A), await book(p.B)];
       const ca = roundTripBps(ba, q), cb = roundTripBps(bb, q);
       if (ca == null || cb == null) { skipped++; continue; }                 // book too thin for the size
-      const crossBps = (ca + cb) / 2;
+      const key = `${p.canon}|${p.A.ex}|${p.B.ex}`;
+      const samples = (COSTS[key] ||= []);
+      samples.unshift({ t: Date.now(), bps: +((ca + cb) / 2).toFixed(2) });
+      samples.splice(30);                                                  // keep the last 30 checks
+      const sorted = samples.map(x => x.bps).sort((x, y) => x - y);
+      const crossBps = sorted[Math.floor(sorted.length / 2)];             // median: one odd snapshot can't move the result
       const r = analyse(p, { a, b }, crossBps);
       if (r.bars < 50) { skipped++; continue; }
       const q2 = quality(p, { a, b });
@@ -263,63 +276,93 @@ async function scan() {
 
 /* ------------------------------------------------------------------ writing the posts */
 const fmt$ = v => (v < 0 ? "-$" : "+$") + Math.abs(v).toFixed(Math.abs(v) < 100 ? 0 : 0);
-const hhmm = t => new Intl.DateTimeFormat("en-GB", { timeZone: CFG.tz, hour: "2-digit", minute: "2-digit" }).format(new Date(t));
-const dayName = t => new Intl.DateTimeFormat("en-GB", { timeZone: CFG.tz, weekday: "short", day: "numeric", month: "short" }).format(new Date(t));
-const xLen = s => [...s].reduce((n, ch) => n + (/[ᄀ-￿]/.test(ch) && !/[ -⯿]/.test(ch) ? 2 : 1), 0);   // X counts wide characters double
+const hhmm = t => new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", hour: "2-digit", minute: "2-digit" }).format(new Date(t));      // posts use UTC
+const dayName = t => new Intl.DateTimeFormat("en-GB", { timeZone: "UTC", weekday: "short", day: "numeric", month: "short" }).format(new Date(t));
+// X's own weighting (twitter-text v3): these code points count 1, everything else (→ • ↓ … emoji, CJK) counts 2
+const xLen = s => [...s].reduce((n, ch) => { const c = ch.codePointAt(0); return n + ((c <= 4351 || (c >= 8192 && c <= 8205) || (c >= 8208 && c <= 8223) || (c >= 8242 && c <= 8247)) ? 1 : 2); }, 0);
 function fit(s, max = 275) { if (xLen(s) <= max) return s; let out = s; while (xLen(out + "…") > max) out = out.slice(0, -1); return out.trimEnd() + "…"; }
 
-/* The slot a run belongs to: the latest 09:00 or 21:00 (Istanbul) at or before `t`.
+/* The slot a run belongs to: the latest slot hour (UTC) at or before `t`.
    Posts are labelled and windowed by the slot, not by when GitHub happened to start the run. */
 function slotOf(t = Date.now()) {
-  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone: CFG.tz, year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(new Date(t)).map(p => [p.type, +p.value]));
-  const localAsUTC = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
-  const offset = localAsUTC - Math.floor(t / 1000) * 1000;               // tz offset in ms at time t
-  const h = [...SLOT_HOURS].reverse().find(x => parts.hour >= x);
-  const day = Date.UTC(parts.year, parts.month - 1, parts.day);
-  const local = h === undefined ? day - 864e5 + SLOT_HOURS.at(-1) * 3600e3 : day + h * 3600e3;
-  return local - offset;
+  const day = Math.floor(t / 864e5) * 864e5, h = new Date(t).getUTCHours();
+  const s = [...SLOT_HOURS].reverse().find(x => h >= x);
+  return s === undefined ? day - 864e5 + SLOT_HOURS.at(-1) * 3600e3 : day + s * 3600e3;
 }
 
+const pct = bps => (Math.abs(bps) / 100).toFixed(2) + "%";
+function px(v) { const d = v >= 1000 ? 1 : v >= 100 ? 2 : v >= 1 ? 3 : 5; return "$" + v.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }); }
+const dur = h => h < 1 ? Math.round(h * 60) + " min" : (Math.round(h * 10) / 10) + "h";
+
 function compose(scan, slot = slotOf()) {
-  const now = slot;                                                       // the post describes the 12h ending at its slot
-  const hourLocal = +new Intl.DateTimeFormat("en-GB", { timeZone: CFG.tz, hour: "2-digit", hourCycle: "h23" }).format(new Date(slot));
-  const session = CFG.session || (hourLocal < 15 ? "morning" : "evening");
-  const from = slot - 12 * 3600e3;
+  const now = slot, from = slot - 12 * 3600e3;                            // each post covers the 12 hours ending at its slot
+  const inRange = t => t >= from && t < now;
   const clean = scan.results.filter(r => r.quality.score >= 65);
-  const flaggedWins = scan.results.filter(r => r.quality.score < 65 && r.trades.some(t => !t.open && t.tIn >= from && t.tIn < now));
+  const flaggedWins = scan.results.filter(r => r.quality.score < 65 && r.trades.some(t => !t.open && inRange(t.tIn)));
   const all = clean.flatMap(r => r.trades.map(t => ({ ...t, r })));
-  const inWin = all.filter(t => t.tIn >= from && t.tIn < now && !t.open);
+  const inWin = all.filter(t => inRange(t.tIn) && !t.open).sort((a, b) => b.net - a.net);
   const openNow = all.filter(t => t.open);
-  const closed = inWin.filter(t => t.reason !== "deadline");
   const total = inWin.reduce((s, t) => s + t.net, 0);
-  const best = [...inWin].sort((a, b) => b.net - a.net);
   const spreadOnly = scan.results.reduce((s, r) => s + r.spreadOnly, 0);
   const thinPrints = scan.results.reduce((s, r) => s + r.thinPrints, 0);
   const weekend = sessionOf(now) === "weekend";
-  const label = session === "morning" ? `Overnight, ${hhmm(from)}–${hhmm(now)}` : `Daytime, ${hhmm(from)}–${hhmm(now)}`;
-  const venues = (t) => t.side > 0 ? `sell ${t.r.p.B.label} / buy ${t.r.p.A.label}` : `sell ${t.r.p.A.label} / buy ${t.r.p.B.label}`;
+  const nPairs = scan.results.length;
+  const span = `${hhmm(from)}–${hhmm(now)} UTC`;
+  const rich = t => t.side > 0 ? { n: t.r.p.B.name, i: 1 } : { n: t.r.p.A.name, i: 0 };
+  const cheap = t => t.side > 0 ? { n: t.r.p.A.name, i: 0 } : { n: t.r.p.B.name, i: 1 };
+  const posts = [];
 
-  let first;
-  if (!inWin.length) {
-    first = `Perp Spread Desk · ${dayName(now)}\n${label} (Istanbul)\n\n` +
-      `No gap of ${CFG.entry}+ bps stayed fillable for 1h+ across ${scan.results.length} stock, index, FX and commodity pairs on Hyperliquid and Lighter.` +
-      (openNow.length ? `\n\nOpen now: ${[...new Set(openNow.map(t => nice(t.r.p.canon)))].slice(0, 3).join(", ")}.` : "") +
-      (weekend ? "\n\nWeekend: underlying markets are shut, perps drift without an outside price." : "");
+  // 1. what this is + headline
+  const intro = `Same asset, two exchanges, two prices.\n\n` +
+    `Twice a day I scan ${nPairs} stock, index, FX and commodity perps on Hyperliquid and Lighter for price gaps you could really have traded.`;
+  if (inWin.length) {
+    posts.push(`${intro}\n\n${dayName(now)}, ${span}: ${inWin.length} real gap${inWin.length > 1 ? "s" : ""} found. ` +
+      `${inWin.length > 1 ? "The best one" : "Here's how it played out"} ↓`);
   } else {
-    const b = best[0];
-    first = `Perp Spread Desk · ${dayName(now)}\n${label} (Istanbul)\n\n` +
-      `${inWin.length} gap${inWin.length > 1 ? "s" : ""} of ${CFG.entry}+ bps stayed fillable 1h+ after crossing both books. ${closed.length} closed the same day.\n\n` +
-      `Best: ${nice(b.r.p.canon)}, ${venues(b)}, ${b.fillIn.toFixed(0)} bps → ${b.reason === "deadline" ? "still open at midnight" : `${b.reason === "flipped" ? `flipped to -${Math.abs(b.gOut).toFixed(0)}` : Math.abs(b.gOut).toFixed(0)} in ${b.hours < 1 ? Math.round(b.hours * 60) + "m" : b.hours.toFixed(1) + "h"}`}: ${fmt$(b.net)} on $10k/side, market orders, after fees.`;
+    posts.push(`${intro}\n\n${dayName(now)}, ${span}: no gap was big enough, lasted long enough and survived costs.` +
+      (weekend ? "\n\nWeekend: the stock markets behind these perps are shut, so prices drift without an outside anchor." : "") +
+      (spreadOnly || thinPrints ? " Why ↓" : ""));
   }
-  const lines = [];
-  if (best.length > 1) lines.push(`Also: ${best.slice(1, 4).map(t => `${nice(t.r.p.canon)} ${fmt$(t.net)}`).join(", ")}. Total ${fmt$(total)}.`);
-  if (flaggedWins.length) lines.push(`Left out: ${flaggedWins.slice(0, 3).map(r => nice(r.p.canon)).join(", ")} (one venue spiking or stale book, likely not a real gap).`);
-  if (spreadOnly || thinPrints) lines.push(`Thrown out over the last ${CFG.days} days: ${[spreadOnly && `${spreadOnly} "gaps" that were only the bid/ask spreads`, thinPrints && `${thinPrints} where one venue traded less than $10k around entry`].filter(Boolean).join(" and ")}.`);
-  if (openNow.length && inWin.length) lines.push(`Still open: ${[...new Set(openNow.map(t => nice(t.r.p.canon)))].slice(0, 3).join(", ")}.`);
-  if (weekend && inWin.length) lines.push("Weekend: underlying markets shut, so these gaps had no outside price.");
-  lines.push(`Simulated, not trades. Not financial advice.\nLive desk: link in bio.`);
-  return { session, posts: [fit(first), fit(lines.join("\n\n"))], stats: { session, from, to: now, opportunities: inWin.length, closed: closed.length, total: +total.toFixed(2), spreadOnly, thinPrints, pairs: scan.results.length, best: best.slice(0, 3).map(t => ({ asset: t.r.p.canon, venues: venues(t), net: +t.net.toFixed(2), fillIn: +t.fillIn.toFixed(1), reason: t.reason })) } };
+
+  // 2 + 3. the best trade, explained step by step
+  if (inWin.length) {
+    const t = inWin[0], R = rich(t), C = cheap(t);
+    posts.push(`${nice(t.r.p.canon)} trades on ${R.n} and on ${C.n}.\n\n` +
+      `At ${hhmm(t.tIn)} UTC:\n• ${R.n}: ${px(t.pxIn[R.i])}\n• ${C.n}: ${px(t.pxIn[C.i])}\n\n` +
+      `${R.n} was ${pct(Math.abs(t.gIn))} higher, and had been for over an hour. That's big enough to pay the costs of trading it.`);
+    const how = t.reason === "flipped" ? `the gap had closed and flipped ${pct(Math.abs(t.gOut))} the other way`
+      : t.reason === "deadline" ? `the gap was still open, so it was closed at the end of the day`
+      : Math.sign(t.gOut) === -t.side ? `the gap had closed (${pct(Math.abs(t.gOut))} past even)`
+      : `the gap had shrunk to ${pct(Math.abs(t.gOut))}`;
+    posts.push(`The trade: sell the expensive one, buy the cheap one, $10k each. No bet on where the price goes, only that the two prices meet again.\n\n` +
+      `${dur(t.hours)} later (${hhmm(t.tOut)} UTC) ${how}, so both positions were closed.`);
+    posts.push(`The math:\n\n` +
+      `Gap captured: ${pct(t.grossBps)} → ${fmt$(Math.round(t.grossUsd))}\n` +
+      `Costs: ${pct(t.costBps)} → -$${Math.round(t.costUsd)} (exchange fees + crossing both order books)\n` +
+      `Result: ${fmt$(Math.round(t.grossUsd) - Math.round(t.costUsd))} on $10k a side.\n\n` +
+      `Costs are estimated from typical order books, not the exact book at that minute.`);
+    if (inWin.length > 1) posts.push(`Other gaps in the same window: ${inWin.slice(1, 4).map(x => `${nice(x.r.p.canon)} ${fmt$(x.net)}`).join(", ")}. All of them: ${fmt$(total)} on $10k a side.`);
+  }
+
+  // 4. what got thrown out, and the fine print
+  const why = [];
+  if (spreadOnly) why.push(`${spreadOnly} looked 0.10%+ apart on last price, but it was only the bid/ask spread: buying and selling at real prices eats the whole gap.`);
+  if (thinPrints) why.push(`${thinPrints} were a few trades under $10k, not a price you could fill.`);
+  const pairName = p => `${nice(p.canon)}, ${p.A.name} vs ${p.B.name}`;
+  if (flaggedWins.length) why.push(`Left out: ${flaggedWins.slice(0, 2).map(r => pairName(r.p)).join(", ")}: one exchange spiking alone or a stale book.`);
+  const tail = [];
+  if (why.length) tail.push(`Most "gaps" aren't real. In the last ${CFG.days} days:`, ...why);
+  const opens = [...new Set(openNow.map(t => pairName(t.r.p)))].slice(0, 2);
+  if (opens.length) tail.push(`Gap open right now, not closed yet: ${opens.join(", ")}.`);
+  tail.push(`Simulated on real prices, not my trades. Not financial advice. Live desk: link in bio.`);
+  let cur = "";                                                           // pack the paragraphs into as few posts as fit
+  for (const para of tail) { const next = cur ? cur + "\n\n" + para : para; if (xLen(next) <= 280) cur = next; else { posts.push(cur); cur = para; } }
+  posts.push(cur);
+
+  for (const p of posts) if (xLen(p) > 280) console.error(`WARNING: post is ${xLen(p)} chars, will be cut:\n${p}`);
+  const best = inWin.slice(0, 3);
+  return { session: span, posts: posts.map(p => fit(p, 280)), stats: { from, to: now, opportunities: inWin.length, total: +total.toFixed(2), spreadOnly, thinPrints, pairs: nPairs,
+    best: best.map(t => ({ asset: t.r.p.canon, rich: rich(t).n, cheap: cheap(t).n, net: +t.net.toFixed(2), grossBps: +t.grossBps.toFixed(1), costBps: +t.costBps.toFixed(1), crossBps: +t.crossBps.toFixed(1), reason: t.reason, tIn: t.tIn, tOut: t.tOut })) } };
 }
 
 /* ------------------------------------------------------------------ X API (OAuth 1.0a user context) */
@@ -344,10 +387,10 @@ async function tweet(text, replyTo, keys) {
 /* ------------------------------------------------------------------ main */
 let hist = [];
 try { hist = JSON.parse(fs.readFileSync(CFG.historyFile, "utf8")); } catch { }
-const slot = slotOf();
+const slot = slotOf(process.env.SLOT_AT ? Date.parse(process.env.SLOT_AT) : Date.now());   // SLOT_AT: dry-run tests of a past slot
 const slotISO = new Date(slot).toISOString();
 const lateMin = Math.round((Date.now() - slot) / 60e3);
-console.log(`Slot ${hhmm(slot)} ${dayName(slot)} (Istanbul), ${slotISO}; this run started ${lateMin} min after it.`);
+console.log(`Slot ${hhmm(slot)} UTC ${dayName(slot)}, ${slotISO}; this run started ${lateMin} min after it.`);
 if (SLOTTED) {
   const done = hist.find(h => h.slot === slotISO && (h.posted || h.trigger === "schedule"));
   if (done) { console.log(`Slot already handled at ${done.at}: nothing to do.`); process.exit(0); }
@@ -374,3 +417,4 @@ if (POST) {
 hist.unshift({ at: new Date().toISOString(), slot: slotISO, trigger: SLOTTED ? "schedule" : "manual", lateMin,
   posted: POST && !!out.stats.tweetIds, ...out.stats, posts: out.posts });
 fs.writeFileSync(CFG.historyFile, JSON.stringify(hist.slice(0, 120), null, 1));
+fs.writeFileSync(CFG.costsFile, JSON.stringify(COSTS));

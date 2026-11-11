@@ -49,10 +49,15 @@ Pre-IPO markets price off each venue's own order book, so their gaps are not gua
 
 ## X bot
 
-`bot/run.mjs` runs the same scanner without a browser and writes a two-post thread:
-the last 12 hours of fillable gaps (stocks, indices, FX, commodities on Hyperliquid and Lighter),
-the best one with its market-order result after fees, and what was thrown out (spread-only gaps,
-gaps on venues that traded less than the trade size). `.github/workflows/x-posts.yml` runs it at
-09:07 and 21:07 Istanbul time. Without the `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN` and
-`X_ACCESS_SECRET` repository secrets it only prints the posts (dry run). Test locally with
-`node bot/run.mjs`.
+`bot/run.mjs` runs the same scanner without a browser and writes a thread for readers new to the idea:
+what it scans, the best fillable gap of the last 12 hours step by step (prices on both venues, the trade,
+when it closed, gap captured minus costs), and what was thrown out (spread-only gaps, gaps on venues
+that traded less than the trade size). Times in the posts are UTC.
+
+Slots are 06:00 and 18:00 UTC (`SLOT_HOURS` in `bot/run.mjs`, plus the crons in
+`.github/workflows/x-posts.yml`). GitHub starts scheduled runs late or drops them, so each slot gets a
+run every 15 minutes for 4 hours: the first posts, the rest see the slot in `bot/history.json` and stop.
+Book costs are the median of the saved order-book checks per pair (`bot/costs.json`), so one odd
+snapshot can't swing a result. Without the `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN` and
+`X_ACCESS_SECRET` repository secrets it only prints the posts. Test locally with `node bot/run.mjs`
+(never posts) or a past slot with `SLOT_AT=2026-11-10T18:30Z node bot/run.mjs`.

@@ -9,8 +9,8 @@ name: X posts
 # slot (09:00 / 21:00 Istanbul), never by when the runner happened to start.
 on:
   schedule:
-    - cron: "2,17,32,47 6-9 * * *"     # 09:00 slot (06:00 UTC): overnight summary
-    - cron: "2,17,32,47 18-21 * * *"   # 21:00 slot (18:00 UTC): daytime summary
+    - cron: "2,17,32,47 6-9 * * *"     # 06:00 UTC slot (09:00 Istanbul, for testing). Keep in sync with SLOT_HOURS in bot/run.mjs
+    - cron: "2,17,32,47 18-21 * * *"   # 18:00 UTC slot (21:00 Istanbul)
   workflow_dispatch:
     inputs:
       post:
@@ -65,5 +65,5 @@ jobs:
         run: |
           git config user.name "perp-spread-desk-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bot/history.json || true
+          git add bot/history.json bot/costs.json || true
           git diff --cached --quiet || (git commit -m "Bot: session summary $(date -u +%Y-%m-%dT%H:%MZ)" && (git push || (git pull --rebase && git push)))
