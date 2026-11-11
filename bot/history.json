@@ -1,5 +1,45 @@
 [
  {
+  "at": "2026-11-11T14:16:24.200Z",
+  "slot": "2026-11-11T06:00:00.000Z",
+  "trigger": "manual",
+  "lateMin": 495,
+  "posted": false,
+  "from": 1794333600000,
+  "to": 1794376800000,
+  "opportunities": 1,
+  "total": 30.15,
+  "spreadOnly": 46,
+  "thinPrints": 14,
+  "pairs": 52,
+  "best": [
+   {
+    "asset": "UNITREE",
+    "rich": "Hyperliquid Paragon",
+    "cheap": "Hyperliquid XYZ",
+    "net": 30.15,
+    "grossUsd": 59.5,
+    "feeUsd": 3.6,
+    "bookUsd": 25.75,
+    "crossBps": 12.9,
+    "reason": "flipped",
+    "tIn": 1794360900000,
+    "tOut": 1794365700000,
+    "costSrc": [
+     "typical",
+     "typical"
+    ]
+   }
+  ],
+  "posts": [
+   "Same stock, two exchanges, two prices. I track 52 stock, index, FX and commodity perps on Hyperliquid and Lighter to see if those gaps can actually be traded after fees and spreads.\n\nOvernight (18:00–06:00 UTC): one trade cleared the bar, in UNITREE.",
+   "UNITREE: Hyperliquid's Paragon listing traded 0.42% above XYZ's for 1h+ during Asian hours, peaking at 1.24%.\n\nShort Paragon at $111.40, long XYZ at $110.93. The gap closed and overshot by 0.17% within 1.3h.\n\nOn $10k a side: +$59 gross, −$30 fees and spread (est.), +$29 net.",
+   "Hyperliquid's Paragon market is the rich venue: its listings sat a median 0.26% above the same assets elsewhere. But its books cost 0.18% to get in and out of $10k, vs 0.02% on XYZ, which eats most of it.",
+   "Funding: UNITREE paid -222% a year on Lighter vs -369% on Paragon. Shorts pay on both venues: a crowded short. The carry is worth ≈$40/day per $10k, but the price gap between those two swung 1.55% (≈$155) in the same 12h.",
+   "Scorecard, last 3 days: 10 trades, 7 profitable, +$126 net on $10k a side.\n\nThe rule: at least 0.10% left after crossing both order books, held for an hour, real volume on both sides, closed the same day. Market orders, fees included.\n\nSimulated, not advice."
+  ]
+ },
+ {
   "at": "2026-11-11T13:41:05.956Z",
   "slot": "2026-11-11T06:00:00.000Z",
   "trigger": "manual",
