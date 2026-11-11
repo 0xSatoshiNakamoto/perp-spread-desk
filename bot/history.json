@@ -1,5 +1,38 @@
 [
  {
+  "at": "2026-11-11T06:50:21.369Z",
+  "slot": "2026-11-11T06:00:00.000Z",
+  "trigger": "schedule",
+  "lateMin": 49,
+  "posted": true,
+  "session": "morning",
+  "from": 1794333600000,
+  "to": 1794376800000,
+  "opportunities": 1,
+  "closed": 1,
+  "total": 20.45,
+  "spreadOnly": 62,
+  "thinPrints": 8,
+  "pairs": 54,
+  "best": [
+   {
+    "asset": "UNITREE",
+    "venues": "sell HL para / buy HL xyz",
+    "net": 20.45,
+    "fillIn": 24.6,
+    "reason": "flipped"
+   }
+  ],
+  "tweetIds": [
+   "2120408758425616833",
+   "2120408765836988694"
+  ],
+  "posts": [
+   "Perp Spread Desk · Wed 11 Nov\nOvernight, 21:00–09:00 (Istanbul)\n\n1 gap of 10+ bps stayed fillable 1h+ after crossing both books. 1 closed the same day.\n\nBest: UNITREE, sell HL para / buy HL xyz, 25 bps → flipped to -17 in 1.3h: +$20 on $10k/side, market orders, after fees.",
+   "Thrown out over the last 3 days: 62 \"gaps\" that were only the bid/ask spreads and 8 where one venue traded less than $10k around entry.\n\nStill open: UNITREE.\n\nSimulated, not trades. Not financial advice.\nLive desk: link in bio."
+  ]
+ },
+ {
   "at": "2026-11-10T23:09:19.818Z",
   "posted": false,
   "session": "morning",
