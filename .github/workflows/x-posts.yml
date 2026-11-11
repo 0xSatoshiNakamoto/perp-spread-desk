@@ -38,6 +38,11 @@ jobs:
         with:
           ref: main          # latest main at run time, so a queued run sees the history the previous run saved
 
+      - uses: actions/checkout@v4
+        with:
+          ref: data          # order-book cost history from the recorder
+          path: data
+
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -45,6 +50,7 @@ jobs:
       - name: Scan and post
         env:
           TZ: Europe/Istanbul
+          COSTS_FILE: data/costs.json
           X_API_KEY: ${{ secrets.X_API_KEY }}
           X_API_SECRET: ${{ secrets.X_API_SECRET }}
           X_ACCESS_TOKEN: ${{ secrets.X_ACCESS_TOKEN }}
@@ -65,5 +71,5 @@ jobs:
         run: |
           git config user.name "perp-spread-desk-bot"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add bot/history.json bot/costs.json || true
+          git add bot/history.json || true
           git diff --cached --quiet || (git commit -m "Bot: session summary $(date -u +%Y-%m-%dT%H:%MZ)" && (git push || (git pull --rebase && git push)))

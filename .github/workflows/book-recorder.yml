@@ -1,0 +1,41 @@
+# Records the $10k round-trip cost of both order books for every pair, every ~30 min,
+# so the X report prices each trade with the cost measured near the time it happened.
+# Data lives on the "data" branch (bot/costs.json there), so these commits never touch the site.
+name: Book recorder
+
+on:
+  schedule:
+    - cron: "11,41 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: book-recorder
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/checkout@v4
+        with:
+          ref: data
+          path: data
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Record books
+        run: COSTS_FILE=data/costs.json node bot/run.mjs --record
+      - name: Save
+        working-directory: data
+        run: |
+          git config user.name "perp-spread-desk-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add costs.json
+          git diff --cached --quiet || (git commit -q -m "Books $(date -u +%Y-%m-%dT%H:%MZ)" && (git push -q || (git pull -q --rebase && git push -q)))
