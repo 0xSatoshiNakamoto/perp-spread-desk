@@ -21,6 +21,9 @@ const CFG = {
   historyFile: new URL("./history.json", import.meta.url),
 };
 const POST = process.argv.includes("--post");
+const SLOTTED = process.argv.includes("--slot");   // scheduled runs: post once per slot, whenever the (late) runner gets here
+const SLOT_HOURS = [9, 21];                         // Istanbul time: 09:00 overnight summary, 21:00 daytime summary
+const MAX_LATE_H = 4;                               // a slot not done within 4h is skipped rather than posted stale
 const HL = "https://api.hyperliquid.xyz/info";
 const LT = "https://mainnet.zklighter.elliot.ai/api/v1";
 const IV_MS = { "5m": 300e3, "15m": 900e3 };
@@ -265,14 +268,28 @@ const dayName = t => new Intl.DateTimeFormat("en-GB", { timeZone: CFG.tz, weekda
 const xLen = s => [...s].reduce((n, ch) => n + (/[ᄀ-￿]/.test(ch) && !/[ -⯿]/.test(ch) ? 2 : 1), 0);   // X counts wide characters double
 function fit(s, max = 275) { if (xLen(s) <= max) return s; let out = s; while (xLen(out + "…") > max) out = out.slice(0, -1); return out.trimEnd() + "…"; }
 
-function compose(scan, now = Date.now()) {
-  const hourLocal = +new Intl.DateTimeFormat("en-GB", { timeZone: CFG.tz, hour: "2-digit", hour12: false }).format(new Date(now));
+/* The slot a run belongs to: the latest 09:00 or 21:00 (Istanbul) at or before `t`.
+   Posts are labelled and windowed by the slot, not by when GitHub happened to start the run. */
+function slotOf(t = Date.now()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone: CFG.tz, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(new Date(t)).map(p => [p.type, +p.value]));
+  const localAsUTC = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+  const offset = localAsUTC - Math.floor(t / 1000) * 1000;               // tz offset in ms at time t
+  const h = [...SLOT_HOURS].reverse().find(x => parts.hour >= x);
+  const day = Date.UTC(parts.year, parts.month - 1, parts.day);
+  const local = h === undefined ? day - 864e5 + SLOT_HOURS.at(-1) * 3600e3 : day + h * 3600e3;
+  return local - offset;
+}
+
+function compose(scan, slot = slotOf()) {
+  const now = slot;                                                       // the post describes the 12h ending at its slot
+  const hourLocal = +new Intl.DateTimeFormat("en-GB", { timeZone: CFG.tz, hour: "2-digit", hourCycle: "h23" }).format(new Date(slot));
   const session = CFG.session || (hourLocal < 15 ? "morning" : "evening");
-  const from = now - 12 * 3600e3;                                         // each post covers the last 12 hours
+  const from = slot - 12 * 3600e3;
   const clean = scan.results.filter(r => r.quality.score >= 65);
-  const flaggedWins = scan.results.filter(r => r.quality.score < 65 && r.trades.some(t => !t.open && t.tIn >= from));
+  const flaggedWins = scan.results.filter(r => r.quality.score < 65 && r.trades.some(t => !t.open && t.tIn >= from && t.tIn < now));
   const all = clean.flatMap(r => r.trades.map(t => ({ ...t, r })));
-  const inWin = all.filter(t => t.tIn >= from && !t.open);
+  const inWin = all.filter(t => t.tIn >= from && t.tIn < now && !t.open);
   const openNow = all.filter(t => t.open);
   const closed = inWin.filter(t => t.reason !== "deadline");
   const total = inWin.reduce((s, t) => s + t.net, 0);
@@ -292,8 +309,8 @@ function compose(scan, now = Date.now()) {
   } else {
     const b = best[0];
     first = `Perp Spread Desk · ${dayName(now)}\n${label} (Istanbul)\n\n` +
-      `${inWin.length} gap${inWin.length > 1 ? "s" : ""} of ${CFG.entry}+ bps stayed fillable for 1h+ (after crossing both books). ${closed.length} closed at ${CFG.exit} bps.\n\n` +
-      `Best: ${nice(b.r.p.canon)}, ${venues(b)}, ${b.fillIn.toFixed(0)} bps → ${b.reason === "deadline" ? "still open at midnight" : `${Math.abs(b.gOut).toFixed(0)} in ${b.hours < 1 ? Math.round(b.hours * 60) + "m" : b.hours.toFixed(1) + "h"}`}: ${fmt$(b.net)} on $10k a side, market orders after fees.`;
+      `${inWin.length} gap${inWin.length > 1 ? "s" : ""} of ${CFG.entry}+ bps stayed fillable 1h+ after crossing both books. ${closed.length} closed the same day.\n\n` +
+      `Best: ${nice(b.r.p.canon)}, ${venues(b)}, ${b.fillIn.toFixed(0)} bps → ${b.reason === "deadline" ? "still open at midnight" : `${b.reason === "flipped" ? `flipped to -${Math.abs(b.gOut).toFixed(0)}` : Math.abs(b.gOut).toFixed(0)} in ${b.hours < 1 ? Math.round(b.hours * 60) + "m" : b.hours.toFixed(1) + "h"}`}: ${fmt$(b.net)} on $10k/side, market orders, after fees.`;
   }
   const lines = [];
   if (best.length > 1) lines.push(`Also: ${best.slice(1, 4).map(t => `${nice(t.r.p.canon)} ${fmt$(t.net)}`).join(", ")}. Total ${fmt$(total)}.`);
@@ -325,9 +342,20 @@ async function tweet(text, replyTo, keys) {
 }
 
 /* ------------------------------------------------------------------ main */
+let hist = [];
+try { hist = JSON.parse(fs.readFileSync(CFG.historyFile, "utf8")); } catch { }
+const slot = slotOf();
+const slotISO = new Date(slot).toISOString();
+const lateMin = Math.round((Date.now() - slot) / 60e3);
+console.log(`Slot ${hhmm(slot)} ${dayName(slot)} (Istanbul), ${slotISO}; this run started ${lateMin} min after it.`);
+if (SLOTTED) {
+  const done = hist.find(h => h.slot === slotISO && (h.posted || h.trigger === "schedule"));
+  if (done) { console.log(`Slot already handled at ${done.at}: nothing to do.`); process.exit(0); }
+  if (lateMin > MAX_LATE_H * 60) { console.log(`More than ${MAX_LATE_H}h after the slot: skipping it rather than posting late.`); process.exit(0); }
+}
 const scanned = await scan();
 if (scanned.results.length < 5) { console.error(`Only ${scanned.results.length} pairs scanned: data looks wrong, not posting.`); process.exit(1); }
-const out = compose(scanned);
+const out = compose(scanned, slot);
 console.log(`--- ${out.session} thread (${out.posts.length} posts) ---`);
 out.posts.forEach((p, i) => console.log(`\n[${i + 1}] ${xLen(p)} chars\n${p}`));
 
@@ -336,13 +364,13 @@ if (POST) {
   if (Object.values(keys).some(v => !v)) { console.log("\nNo X keys set: dry run only, nothing posted."); }
   else {
     let id = null; const ids = [];
-    for (const p of out.posts) { id = await tweet(p, id, keys); ids.push(id); await sleep(1500); }
+    try { for (const p of out.posts) { id = await tweet(p, id, keys); ids.push(id); await sleep(1500); } }
+    catch (e) { if (!ids.length) throw e; console.error(`Reply failed after the first post (kept, not retried): ${e.message}`); }
     console.log(`\nPosted: https://x.com/i/status/${ids[0]}`);
     out.stats.tweetIds = ids;
   }
 }
 // keep a short history (also keeps the repo active so GitHub keeps running the schedule)
-let hist = [];
-try { hist = JSON.parse(fs.readFileSync(CFG.historyFile, "utf8")); } catch { }
-hist.unshift({ at: new Date().toISOString(), posted: POST && !!out.stats.tweetIds, ...out.stats, posts: out.posts });
+hist.unshift({ at: new Date().toISOString(), slot: slotISO, trigger: SLOTTED ? "schedule" : "manual", lateMin,
+  posted: POST && !!out.stats.tweetIds, ...out.stats, posts: out.posts });
 fs.writeFileSync(CFG.historyFile, JSON.stringify(hist.slice(0, 120), null, 1));
