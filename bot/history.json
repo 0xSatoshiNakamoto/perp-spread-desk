@@ -1,5 +1,25 @@
 [
  {
+  "at": "2026-11-11T07:09:49.747Z",
+  "slot": "2026-11-11T06:00:00.000Z",
+  "trigger": "manual",
+  "lateMin": 69,
+  "posted": false,
+  "from": 1794333600000,
+  "to": 1794376800000,
+  "opportunities": 0,
+  "total": 0,
+  "spreadOnly": 58,
+  "thinPrints": 4,
+  "pairs": 52,
+  "best": [],
+  "posts": [
+   "Same asset, two exchanges, two prices.\n\nTwice a day I scan 52 stock, index, FX and commodity perps on Hyperliquid and Lighter for price gaps you could really have traded.\n\nWed 11 Nov, 18:00–06:00 UTC: no gap was big enough, lasted long enough and survived costs. Why ↓",
+   "Most \"gaps\" aren't real. In the last 3 days:\n\n58 looked 0.10%+ apart on last price, but it was only the bid/ask spread: buying and selling at real prices eats the whole gap.\n\n4 were a few trades under $10k, not a price you could fill.",
+   "Gap open right now, not closed yet: UNITREE, Hyperliquid XYZ vs Lighter.\n\nSimulated on real prices, not my trades. Not financial advice. Live desk: link in bio."
+  ]
+ },
+ {
   "at": "2026-11-11T06:50:21.369Z",
   "slot": "2026-11-11T06:00:00.000Z",
   "trigger": "schedule",
