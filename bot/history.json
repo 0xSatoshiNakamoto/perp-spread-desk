@@ -1,5 +1,43 @@
 [
  {
+  "at": "2026-11-11T13:41:05.956Z",
+  "slot": "2026-11-11T06:00:00.000Z",
+  "trigger": "manual",
+  "lateMin": 460,
+  "posted": false,
+  "from": 1794333600000,
+  "to": 1794376800000,
+  "opportunities": 1,
+  "total": 30.15,
+  "spreadOnly": 61,
+  "thinPrints": 15,
+  "pairs": 54,
+  "best": [
+   {
+    "asset": "UNITREE",
+    "rich": "Hyperliquid Paragon",
+    "cheap": "Hyperliquid XYZ",
+    "net": 30.15,
+    "grossUsd": 59.5,
+    "feeUsd": 3.6,
+    "bookUsd": 25.75,
+    "crossBps": 12.9,
+    "reason": "flipped",
+    "tIn": 1794360900000,
+    "tOut": 1794365700000
+   }
+  ],
+  "posts": [
+   "Perp gap report · Wed 11 Nov, 18:00–06:00 UTC\n\nSame asset, different price per venue. 54 pairs (stocks, indices, FX, commodities) on Hyperliquid + Lighter.\n\n• Tradeable gaps: 1 (+$30 on $10k/leg)\n• Fake gaps thrown out (3d): 76\n• 3-day record: 10 trades, 7 green, +$126",
+   "UNITREE · HL Paragon rich vs HL XYZ\n\nEntry 01:35 UTC (Asia): short HL Paragon $111.40, long HL XYZ $110.93\nGap 0.42% (peak 1.24%), open 1h+ before entry\nExit 02:55 UTC, 1.3h later: flipped to 0.17% the other way\n\nGross +$59 · fees −$4 · book cost −$26 (est.) · net +$29",
+   "Near misses: the gap held 1h, but not enough to cover crossing both books + 0.10% edge:\n• STRC · HL XYZ / Lighter: held 0.10%, needed 0.14%\n• UNITREE · HL Paragon / Lighter: held 0.24%, needed 0.28%\n• NBIS · HL XYZ / Lighter: held 0.07%, needed 0.13%",
+   "Venue map: median premium vs the same asset elsewhere\n• HL Paragon +0.26% (3 pairs)\n• Lighter +0.03% (46 pairs)\n• HL EntropyIO −0.01% (12 pairs)\n• HL XYZ −0.02% (47 pairs)\n\nBuy + sell $10k now costs (median):\nXYZ 0.02% · Lighter 0.03% · EntropyIO 0.08% · Paragon 0.26%",
+   "Funding carry: avg rate paid these 12h, as APR. Short the higher leg, long the lower:\n• UNITREE: Lighter -222% vs HL Paragon -369% → 147% ≈ $40/day per $10k\n\nRates move hourly; the price gap between legs can outweigh the carry.",
+   "Where the last 3 days' trades started: Asia 7, US after-hours 1, weekend 1, Europe 1.\n\nThrown out (3d): 61 gaps that were only the bid/ask spread, 15 on prints under $10k.\n\nOpen now: UNITREE · HL XYZ / HL Paragon; UNITREE · HL XYZ / Lighter; UNITREE · HL Paragon / Lighter.",
+   "Method: 5-min candles. A gap counts if ≥0.10% is left after crossing both books for $10k, for 1h+, with ≥$10k traded on each venue. Entry 15 min late, exit at ≤0.03% or a flip, same day. Market orders + fees. \"est.\" = typical book cost for that hour.\n\nSimulated, not advice."
+  ]
+ },
+ {
   "at": "2026-11-11T07:09:49.747Z",
   "slot": "2026-11-11T06:00:00.000Z",
   "trigger": "manual",
