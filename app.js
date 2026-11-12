@@ -612,6 +612,7 @@ function tick() {
   if (now % 60000 < 1000) store.set("liveHist", state.liveHist);
 
   runAlerts(now);
+  try { runTelegram(now); } catch (e) { console.error("telegram", e); }
   renderChrome(now);
   renderCurrent();
 }
@@ -643,6 +644,7 @@ function runAlerts(now) {
       const warn = v.jump ? ` <span class="tag stale">${esc(v.jump.m.exchangeLabel)} jumped ${fmtPct(v.jump.r)} in a minute: possible push on one book</span>`
         : sessionOf(now) === "weekend" && ["equity", "index"].includes(v.a.cls) ? ` <span class="tag">weekend: US market shut, no outside price</span>` : "";
       pushEvent("open", `<b>${esc(v.a.label)}</b> ${classTag(v.a.cls)} fillable gap ${fmtBps(v.exec)} bps: ${sideTxt(v)}${warn}`);
+      if (v.execPair) tgOnGapOpen(v);
     } else if (act) {
       act.peak = Math.max(act.peak, v.exec);
       if (v.exec < thrBps * 0.8) {
@@ -658,6 +660,101 @@ document.getElementById("clearFeed").addEventListener("click", () => { state.eve
   const el = document.getElementById(id);
   el.value = store.get(id, el.value);
   el.addEventListener("change", () => { store.set(id, el.value); state.alertActive.clear(); state.alertsArmed = false; state.startedAt = Date.now() - 6000; });
+});
+
+/* ---------- Telegram alerts: gap flips (and optionally new gaps), sent from this tab ---------- */
+// A flip: the tradeable (fill) gap on a venue pair was ≥ X one way (sell A at its bid, buy B at its ask),
+// then within N minutes the reverse (sell B, buy A) is ≥ X and holds for H seconds. Only while this tab is open.
+const tg = { keys: new Map(), queue: [], sending: false };
+const tgEl = id => document.getElementById(id);
+const TG_FIELDS = ["tgToken", "tgChat", "tgFlipThr", "tgWindow", "tgHold", "tgMinVol"];
+const TG_CHECKS = ["tgGaps", "tgOn"];
+const tgCfg = () => ({ token: tgEl("tgToken").value.trim(), chat: tgEl("tgChat").value.trim(), on: tgEl("tgOn").checked, gaps: tgEl("tgGaps").checked,
+  thr: (+tgEl("tgFlipThr").value || 0.3) * 100, win: (+tgEl("tgWindow").value || 60) * 60e3, hold: (+tgEl("tgHold").value || 0) * 1e3, minVol: +tgEl("tgMinVol").value || 0 });
+const tgTokenOk = t => /^\d{5,}:[A-Za-z0-9_-]{30,}$/.test(t);
+function tgLog(text, kind = "") {
+  const li = document.createElement("li"); li.className = kind;
+  li.textContent = `${new Date().toLocaleTimeString()} · ${text}`;
+  const ul = tgEl("tgLog"); ul.prepend(li); while (ul.children.length > 30) ul.lastChild.remove();
+}
+function tgStatus(text, err) { const s = tgEl("tgStatus"); s.textContent = text; s.className = "status-line" + (err ? " err" : ""); }
+async function tgApi(method, body) {
+  const { token } = tgCfg();
+  if (!tgTokenOk(token)) throw new Error("bot token looks wrong (it is like 123456789:AA… from @BotFather)");
+  const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : {});
+  const j = await r.json().catch(() => ({}));
+  if (!j.ok) throw new Error(j.description || `${r.status} ${r.statusText}`);
+  return j.result;
+}
+function tgSend(text) {
+  tg.queue.push(text);
+  if (tg.sending) return;
+  tg.sending = true;
+  (async () => {
+    while (tg.queue.length) {
+      const t = tg.queue.shift();
+      try { await tgApi("sendMessage", { chat_id: tgCfg().chat, text: t, disable_web_page_preview: true }); tgLog(t.split("\n")[0], "open"); }
+      catch (e) { tgLog("not sent: " + e.message, "close"); tgStatus("Telegram error: " + e.message, true); }
+      await new Promise(r => setTimeout(r, 1100));                         // stay well under Telegram's 1 msg/s per chat
+    }
+    tg.sending = false;
+  })();
+}
+const pctTxt = bps => (bps / 100).toFixed(2) + "%";
+const tgWarn = v => {
+  const w = [];
+  if (v.execPair.some(m => m.exchange === "variational")) w.push("Variational quotes can lag up to ~1 min: confirm on its app first.");
+  if (v.jump) w.push(`${v.jump.m.exchangeLabel} jumped ${fmtPct(v.jump.r)} in a minute: could be a push on one book.`);
+  if (sessionOf(Date.now()) === "weekend" && ["equity", "index"].includes(v.a.cls)) w.push("Weekend: the underlying market is shut.");
+  return w.length ? "\n⚠️ " + w.join("\n⚠️ ") : "";
+};
+function runTelegram(now) {
+  const c = tgCfg();
+  if (!c.on || !c.chat || !tgTokenOk(c.token) || !state.alertsArmed) return;
+  for (const v of state.views.values()) {
+    if (!typeOk(v) || v.ms.length < 2) continue;
+    let k = tg.keys.get(v.a.key);
+    if (!k) tg.keys.set(v.a.key, k = { runDir: null, runStart: 0, seen: {}, fired: {} });
+    const strong = v.exec != null && v.execPair && v.exec >= c.thr && v.minVol >= c.minVol;
+    if (!strong) { k.runDir = null; continue; }
+    const [buy, sell] = v.execPair, dir = `${sell.key}>${buy.key}`, rev = `${buy.key}>${sell.key}`;
+    if (k.runDir !== dir) { k.runDir = dir; k.runStart = now; }
+    const prev = k.seen[rev];
+    if (prev && prev.t < k.runStart && k.runStart - prev.t <= c.win && now - k.runStart >= c.hold && !(k.fired[dir] > prev.t)) {
+      k.fired[dir] = now;
+      tgSend(`🔁 FLIP · ${v.a.label}\n\n` +
+        `Before (${new Date(prev.t).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}): ${prev.sellLab} was rich, fill gap ${pctTxt(prev.gap)}\n` +
+        `Now: ${sell.exchangeLabel} is rich, fill gap ${pctTxt(v.exec)}\n` +
+        `Sell ${sell.exchangeLabel} ${fmtPx(sell.bid)} (bid) / buy ${buy.exchangeLabel} ${fmtPx(buy.ask)} (ask)\n\n` +
+        `Flipped in ${fmtDur(k.runStart - prev.t)}, new side held ${Math.round((now - k.runStart) / 1000)}s. Thinner venue trades ${fmtUsd(v.minVol)}/day.` + tgWarn(v));
+    }
+    const s = k.seen[dir];
+    k.seen[dir] = { t: now, gap: Math.max(v.exec, s && now - s.t < 60e3 ? s.gap : 0), sellLab: sell.exchangeLabel };
+  }
+}
+function tgOnGapOpen(v) {
+  const c = tgCfg();
+  if (!c.on || !c.gaps || !c.chat || !tgTokenOk(c.token) || v.minVol < c.minVol) return;
+  const [buy, sell] = v.execPair;
+  tgSend(`📈 GAP OPEN · ${v.a.label}\n\nFill gap ${pctTxt(v.exec)}: sell ${sell.exchangeLabel} ${fmtPx(sell.bid)} (bid) / buy ${buy.exchangeLabel} ${fmtPx(buy.ask)} (ask)\nThinner venue trades ${fmtUsd(v.minVol)}/day.` + tgWarn(v));
+}
+for (const id of TG_FIELDS) { const el = tgEl(id); el.value = store.get(id, el.value); el.addEventListener("change", () => store.set(id, el.value.trim())); }
+for (const id of TG_CHECKS) { const el = tgEl(id); el.checked = !!store.get(id, false); el.addEventListener("change", () => { store.set(id, el.checked);
+  if (id === "tgOn") tgStatus(el.checked ? "Watching for flips while this tab is open." : "Alerts off."); }); }
+tgEl("tgFind").addEventListener("click", async () => {
+  try {
+    const ups = await tgApi("getUpdates");
+    const m = [...ups].reverse().map(u => u.message || u.channel_post || u.my_chat_member).find(x => x?.chat);
+    if (!m) return tgStatus("No messages yet: open your bot in Telegram, press Start or send it any message, then click Find again.", true);
+    tgEl("tgChat").value = String(m.chat.id); store.set("tgChat", String(m.chat.id));
+    tgStatus(`Chat found: ${m.chat.title || [m.chat.first_name, m.chat.last_name].filter(Boolean).join(" ") || m.chat.username || m.chat.id}. Now click Send test.`);
+  } catch (e) { tgStatus("Could not reach your bot: " + e.message, true); }
+});
+tgEl("tgTest").addEventListener("click", async () => {
+  try {
+    await tgApi("sendMessage", { chat_id: tgCfg().chat, text: "✅ Perp Spread Desk is connected. You'll get a message here when a gap flips." });
+    tgStatus("Test sent. Tick 'Alerts on' to start watching.");
+  } catch (e) { tgStatus("Test failed: " + e.message, true); }
 });
 
 /* =============================================================================================
@@ -1061,7 +1158,13 @@ async function loadDivergence() {
   status.textContent = `Loading ${a.label}: ${mA.exchangeLabel} vs ${mB.exchangeLabel}…`; status.className = "status-line";
   dv.loading = true;
   try {
-    const [sa, sb] = await Promise.all([seriesFor(mA, dv.iv, startMs, endMs), seriesFor(mB, dv.iv, startMs, endMs)]);
+    const load = async m => {
+      for (let i = 0; ; i++) {
+        try { return await seriesFor(m, dv.iv, startMs, endMs); }
+        catch (e) { if (i >= 1) throw new Error(`${m.exchangeLabel} history failed (${e.message || e})`); await new Promise(r => setTimeout(r, e.retryAfterMs || 1500)); }
+      }
+    };
+    const [sa, sb] = await Promise.all([load(mA), load(mB)]);
     const mapB = new Map(sb);
     const ts = [], pa = [], pb = [];
     for (const [t, p] of sa) if (mapB.has(t)) { ts.push(t); pa.push(p); pb.push(mapB.get(t)); }
