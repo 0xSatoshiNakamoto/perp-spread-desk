@@ -1,0 +1,26 @@
+name = "perp-spread-watch"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[durable_objects.bindings]]
+name = "WATCHER"
+class_name = "Watcher"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Watcher"]
+
+[vars]
+GH_REPO = "0xSatoshiNakamoto/perp-spread-desk"
+SLOT_HOURS_UTC = "6,18"     # X posts: 06:00 and 18:00 UTC (keep in sync with bot/run.mjs)
+FLIP_PCT = "0.3"            # tradeable gap each way, %
+FLIP_WINDOW_MIN = "60"      # the reverse must come within this many minutes
+FLIP_HOLD_SEC = "30"        # new side must hold this long
+MIN_VOL_USD = "100000"      # thinner venue's daily volume
+ASSET_TYPES = "tradfi+pre"  # tradfi | tradfi+pre | crypto | all
+
+[observability]
+enabled = true

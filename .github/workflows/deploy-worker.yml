@@ -1,0 +1,51 @@
+# Deploys the always-on watcher (worker/) to Cloudflare. Runs on every push that changes worker/,
+# or by hand from the Actions tab. Needs these repository secrets:
+#   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID   (Cloudflare: "Edit Cloudflare Workers" token)
+#   TG_TOKEN, TG_CHAT                             (your Telegram bot token and chat ID)
+#   GH_DISPATCH_TOKEN                             (GitHub fine-grained token: this repo, Actions read & write)
+name: Deploy watcher
+
+on:
+  push:
+    branches: [main]
+    paths: ["worker/**", ".github/workflows/deploy-worker.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-worker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check secrets
+        id: check
+        env:
+          A: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          B: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          C: ${{ secrets.TG_TOKEN }}
+          D: ${{ secrets.TG_CHAT }}
+          E: ${{ secrets.GH_DISPATCH_TOKEN }}
+        run: |
+          missing=""
+          [ -n "$A" ] || missing="$missing CLOUDFLARE_API_TOKEN"; [ -n "$B" ] || missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          [ -n "$C" ] || missing="$missing TG_TOKEN"; [ -n "$D" ] || missing="$missing TG_CHAT"; [ -n "$E" ] || missing="$missing GH_DISPATCH_TOKEN"
+          if [ -n "$missing" ]; then echo "::warning::Not deploying yet. Missing repository secrets:$missing"; echo "ok=false" >> "$GITHUB_OUTPUT"; else echo "ok=true" >> "$GITHUB_OUTPUT"; fi
+      - uses: cloudflare/wrangler-action@v4.1.3
+        if: steps.check.outputs.ok == 'true'
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          wranglerVersion: "4.155.0"
+          secrets: |
+            TG_TOKEN
+            TG_CHAT
+            GH_DISPATCH_TOKEN
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT }}
+          GH_DISPATCH_TOKEN: ${{ secrets.GH_DISPATCH_TOKEN }}

@@ -1,0 +1,6 @@
+{
+  "name": "perp-spread-watch",
+  "private": true,
+  "type": "module",
+  "devDependencies": { "wrangler": "4.155.0" }
+}
